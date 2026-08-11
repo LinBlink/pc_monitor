@@ -1,4 +1,10 @@
-"""Push the handheld half of PC Monitor to the Miyoo over SSH.
+"""Push the handheld half of PC Monitor to a handheld over SSH.
+
+Two targets, because two firmwares put things in different places and want
+different files:
+
+    --miyoo    Onion OS   -> /mnt/SDCARD/App/PCMonitor   (default)
+    --rocknix  ROCKNIX    -> /storage/roms/ports
 
 Shell scripts must land with LF endings and the exec bit set, which is why this
 uploads through SFTP with explicit newline handling instead of a plain copy.
@@ -6,66 +12,175 @@ uploads through SFTP with explicit newline handling instead of a plain copy.
 
 from __future__ import annotations
 
+import argparse
 import os
 import posixpath
 import sys
+import xml.etree.ElementTree as ET
 
 import paramiko
-
-HOST = os.environ.get("MIYOO_HOST", "192.168.2.5")
-USER = os.environ.get("MIYOO_USER", "onion")
-PWD = os.environ.get("MIYOO_PASS", "onion")
-REMOTE_DIR = "/mnt/SDCARD/App/PCMonitor"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEVICE = os.path.join(HERE, "device")
 
-TEXT_FILES = ["launch.sh", "settings.cfg", "config.json"]
-BINARY_FILES = [("icon.png", os.path.join(HERE, "icon.png"))]
-EXECUTABLE = {"launch.sh"}
+MIYOO = {
+    "host": os.environ.get("MIYOO_HOST", "192.168.2.5"),
+    "user": os.environ.get("MIYOO_USER", "onion"),
+    "password": os.environ.get("MIYOO_PASS", "onion"),
+    "dir": "/mnt/SDCARD/App/PCMonitor",
+    # (local name under device/, remote name, mode)
+    "files": [("launch.sh", "launch.sh", 0o755),
+              ("settings.cfg", "settings.cfg", 0o644),
+              ("config.json", "config.json", 0o644)],
+    "assets": [(os.path.join(HERE, "icon.png"), "icon.png", 0o644)],
+    "settings": "settings.cfg",
+    "open_with": 'Onion 的 Apps 菜单里选 "PC Monitor"。SELECT 退出。',
+}
+
+# ROCKNIX's EmulationStation lists every .sh directly under roms/ports, so the
+# launcher has to sit in that directory itself. Its state, log and settings go
+# in a subdirectory that gamelist.xml marks hidden - otherwise the Ports menu
+# grows a folder next to the entry that launches it.
+ROCKNIX = {
+    "host": os.environ.get("ROCKNIX_HOST", "192.168.2.81"),
+    "user": os.environ.get("ROCKNIX_USER", "root"),
+    "password": os.environ.get("ROCKNIX_PASS", "rocknix"),
+    "dir": "/storage/roms/ports",
+    "data": "/storage/roms/ports/pcmonitor",
+    "files": [("launch_rocknix.sh", "PCMonitor.sh", 0o755)],
+    "data_files": [("settings_rocknix.cfg", "settings.cfg", 0o644)],
+    "assets": [],
+    "settings": "settings.cfg",
+    "gamelist": "/storage/roms/ports/gamelist.xml",
+    # The earlier port of this app dropped its working files straight into the
+    # ports directory; clear them out so a redeploy is not shadowed by stale
+    # settings sitting one level up.
+    "stale": ["settings.cfg", "hosts.txt", "state.cfg", "pcmonitor.log", ".pid"],
+    "open_with": 'EmulationStation 的 Ports 菜单里选 "PC Monitor"。SELECT 退出。',
+}
+
+
+def connect(target: dict) -> paramiko.SSHClient:
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(target["host"], username=target["user"],
+                   password=target["password"], timeout=15,
+                   allow_agent=False, look_for_keys=False)
+    return client
+
+
+def ensure_dir(sftp, path: str) -> None:
+    try:
+        sftp.stat(path)
+    except IOError:
+        sftp.mkdir(path)
+
+
+def put_text(sftp, local: str, remote: str, mode: int) -> None:
+    with open(local, encoding="utf-8") as fh:
+        body = fh.read().replace("\r\n", "\n")
+    with sftp.open(remote, "w") as out:
+        out.write(body)
+    sftp.chmod(remote, mode)
+    print(f"  wrote   {remote} ({len(body)} bytes)")
+
+
+def update_gamelist(sftp, path: str) -> None:
+    """Give the entry a real name and hide the working directory next to it.
+
+    ES writes this file back itself, so the existing content (PortMaster's own
+    hidden-folder entry, scraped metadata) is merged into rather than replaced.
+    """
+    try:
+        with sftp.open(path) as fh:
+            root = ET.fromstring(fh.read().decode("utf-8"))
+    except (IOError, ET.ParseError):
+        root = ET.Element("gameList")
+
+    wanted = [("game", "./PCMonitor.sh", "PC Monitor",
+               "通过 WiFi 全屏显示 PC 的 CPU / GPU / 内存 / 网络 / 游戏 FPS。"
+               "左右键切换设备，Y 转屏，SELECT 退出。", False),
+              ("folder", "./pcmonitor", "PC Monitor data", None, True)]
+
+    for tag, rel, name, desc, hidden in wanted:
+        node = next((n for n in root.findall(tag)
+                     if (n.findtext("path") or "").strip() == rel), None)
+        if node is None:
+            node = ET.SubElement(root, tag)
+            ET.SubElement(node, "path").text = rel
+        for field, value in (("name", name), ("desc", desc),
+                             ("hidden", "true" if hidden else None)):
+            if value is None:
+                continue
+            child = node.find(field)
+            if child is None:
+                child = ET.SubElement(node, field)
+            child.text = value
+
+    ET.indent(root, space="\t")
+    body = ET.tostring(root, encoding="unicode")
+    with sftp.open(path, "w") as out:
+        out.write(body)
+    print(f"  wrote   {path} (Ports 菜单条目)")
 
 
 def main() -> int:
-    keep_settings = "--keep-settings" in sys.argv
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rocknix", action="store_true", help="deploy to ROCKNIX")
+    ap.add_argument("--miyoo", action="store_true", help="deploy to Onion (default)")
+    ap.add_argument("--keep-settings", action="store_true",
+                    help="leave the handheld's own settings.cfg alone")
+    args = ap.parse_args()
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(HOST, username=USER, password=PWD, timeout=15,
-                   allow_agent=False, look_for_keys=False)
+    target = ROCKNIX if args.rocknix else MIYOO
+    print(f"Deploying to {target['user']}@{target['host']}:{target['dir']}")
+
+    client = connect(target)
     sftp = client.open_sftp()
 
-    try:
-        sftp.stat(REMOTE_DIR)
-    except IOError:
-        sftp.mkdir(REMOTE_DIR)
+    ensure_dir(sftp, target["dir"])
+    data_dir = target.get("data")
+    if data_dir:
+        ensure_dir(sftp, data_dir)
 
-    existing = set(sftp.listdir(REMOTE_DIR))
-
-    for name in TEXT_FILES:
-        if name == "settings.cfg" and keep_settings and name in existing:
-            print(f"  keep    {name}")
+    groups = [(target["dir"], target["files"]),
+              (data_dir, target.get("data_files", []))]
+    for base, files in groups:
+        if not base:
             continue
-        with open(os.path.join(DEVICE, name), encoding="utf-8") as fh:
-            body = fh.read().replace("\r\n", "\n")
-        remote = posixpath.join(REMOTE_DIR, name)
-        with sftp.open(remote, "w") as out:
-            out.write(body)
-        sftp.chmod(remote, 0o755 if name in EXECUTABLE else 0o644)
-        print(f"  wrote   {name} ({len(body)} bytes)")
+        existing = set(sftp.listdir(base))
+        for local_name, remote_name, mode in files:
+            if (remote_name == target["settings"] and args.keep_settings
+                    and remote_name in existing):
+                print(f"  keep    {remote_name}")
+                continue
+            put_text(sftp, os.path.join(DEVICE, local_name),
+                     posixpath.join(base, remote_name), mode)
 
-    for name, local in BINARY_FILES:
-        remote = posixpath.join(REMOTE_DIR, name)
+    for local, remote_name, mode in target["assets"]:
+        remote = posixpath.join(target["dir"], remote_name)
         sftp.put(local, remote)
-        sftp.chmod(remote, 0o644)
-        print(f"  wrote   {name}")
+        sftp.chmod(remote, mode)
+        print(f"  wrote   {remote_name}")
+
+    for name in target.get("stale", []):
+        stale = posixpath.join(target["dir"], name)
+        try:
+            sftp.remove(stale)
+            print(f"  removed {stale} (前一版留下的)")
+        except IOError:
+            pass
+
+    if target.get("gamelist"):
+        update_gamelist(sftp, target["gamelist"])
 
     sftp.close()
 
-    _, out, _ = client.exec_command(f"ls -l {REMOTE_DIR}")
+    _, out, _ = client.exec_command(f"ls -l {target['dir']}")
     print(out.read().decode("utf-8", "replace"))
     client.close()
-    print(f"Deployed to {HOST}:{REMOTE_DIR}")
-    print("Open Onion's Apps menu and launch \"PC Monitor\". MENU exits.")
+    print(f"Deployed to {target['host']}:{target['dir']}")
+    print(target["open_with"])
     return 0
 
 

@@ -1,9 +1,15 @@
 # PC Monitor — 掌机 WiFi 实时看电脑状态
 
 在 Windows PC 上跑一个小服务，把 CPU / 内存 / 网络 / GPU / 游戏 FPS 画成一张
-仪表盘，通过 WiFi 以 MJPEG 流推给 Miyoo Mini Plus（Onion OS）全屏显示。掌机会自己
-扫局域网找出所有能监控的 PC，左右键切换，Y 键转屏（支持竖屏），自己的电量也会显示
-在顶栏、低电量时震动。
+仪表盘，通过 WiFi 以 MJPEG 流推给掌机全屏显示。掌机会自己扫局域网找出所有能监控
+的 PC，左右键切换，Y 键转屏（支持竖屏），自己的电量也会显示在顶栏、低电量时震动。
+
+支持两类掌机，共用同一个 PC 端服务：
+
+| 掌机 | 系统 | 播放器 | 部署位置 |
+|---|---|---|---|
+| Miyoo Mini Plus | Onion OS | ffplay | `/mnt/SDCARD/App/PCMonitor` |
+| Powkiddy X55 等 RK3566 机器 | ROCKNIX | mpv | `/storage/roms/ports` |
 
 一屏包含：CPU 总占用 / 温度 / 功耗 / 每个逻辑核心的占用与实时频率、游戏 FPS、
 GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用前三的进程、网络实时
@@ -24,10 +30,10 @@ GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用�
 | `render.py` | Pillow 绘制仪表盘（横/竖两套版式 + 旋转 + 180° 预旋转） |
 | `preview.py` | 用假数据出图，改版式时看效果 |
 | `make_icon.py` | 生成掌机启动器图标 |
-| `deploy_device.py` | 把掌机端推送到 `/mnt/SDCARD/App/PCMonitor` |
+| `deploy_device.py` | 把掌机端推送过去（`--miyoo` / `--rocknix`） |
 | `paths.py` | 区分「exe 旁边的可写文件」和「打包进去的只读文件」 |
 | `build_exe.py` | 打包成单文件 `dist/PCMonitor.exe` |
-| `device/` | 掌机端：`launch.sh` / `config.json` / `settings.cfg` |
+| `device/` | 掌机端：Onion 用 `launch.sh` / `config.json` / `settings.cfg`，ROCKNIX 用 `launch_rocknix.sh` / `settings_rocknix.cfg` |
 
 ## 用 exe 跑（推荐，换机器不用装环境）
 
@@ -77,11 +83,16 @@ python -m pip install psutil pillow paramiko
 3. **掌机端部署**（已经部署过就不用再跑）：
 
    ```
-   python deploy_device.py                  # 覆盖全部文件
-   python deploy_device.py --keep-settings  # 保留掌机上已改的 settings.cfg
+   python deploy_device.py                    # Miyoo / Onion，覆盖全部文件
+   python deploy_device.py --rocknix          # ROCKNIX
+   python deploy_device.py --rocknix --keep-settings   # 保留掌机上已改的 settings.cfg
    ```
 
-4. **掌机上打开**：Onion 的 `Apps` 菜单里选 **PC Monitor**。
+   地址和口令走环境变量：`MIYOO_HOST` / `MIYOO_USER` / `MIYOO_PASS`，
+   `ROCKNIX_HOST` / `ROCKNIX_USER` / `ROCKNIX_PASS`（默认
+   `192.168.2.81` / `root` / `rocknix`）。
+
+4. **掌机上打开**：Onion 在 `Apps` 菜单，ROCKNIX 在 `Ports` 菜单，都叫 **PC Monitor**。
 
 > ⚠️ **重新部署前先在掌机上退出本应用。** busybox 的 sh 会边跑边读脚本文件，
 > 覆盖正在运行的 `launch.sh` 会让它执行错乱并留下一堆僵尸进程。
@@ -127,6 +138,31 @@ python -m pip install psutil pillow paramiko
 PC 端完成**：0/2 用横版 640×480，1/3 用竖版 480×640 再旋转进 640×480 的画框。
 竖版不是把横版硬转——它是单独一套自适应高度的版式，五块指标的走势曲线一条都不少。
 
+### 180° 预翻转：掌机自己算掉，不动服务端
+
+Miyoo 的面板是**倒装**的，所以 PC 在最后统一翻 180°（`config.json` 里的
+`rotate180`，设置页那个开关）。ROCKNIX 这台不倒装，多的这 180° 得去掉。
+
+去掉的办法不是让 PC 别翻，而是**掌机自己用 orient 抵消**：180° 就是两个 1/4 圈，
+`orient` 到角度的映射是 `{0:0, 1:270, 2:180, 3:90}`，所以 `orient+2` 恒等于
+`orient` 再转 180°，而且奇偶不变、版式也不变。要抵消一次翻转，请求 `orient+2` 即可。
+
+```
+send = (ORIENT + 2) % 4   如果 PC 的 rotate180 != 本机 PANEL_FLIP
+send =  ORIENT            否则
+```
+
+每次连接都按**那台 PC 的** `/config.json` 重算，因为 `rotate180` 是每台 PC 各自的
+设置——不重算的话，在"翻"和"不翻"的两台 PC 之间切换，画面就会中途倒过来。
+
+**为什么不加一个 `?flip=0` 让服务端别翻**：那样要求每一台被监控的 PC 都升级到认识
+这个参数的版本，而一个机群不可能同时都在同一个版本上。实测就是这样翻的车：掌机
+发 `?flip=0`，只有升级过的那台听懂了，另外两台照旧多转 180°，于是**按左右键换台
+时画面会突然倒过来**。改成掌机算，对新旧服务端一视同仁，另一端一个字节都不用动。
+
+ROCKNIX 上尺寸正好对得上：sway 用 `transform=270` 驱动 DSI-1，逻辑输出 **960×720**，
+是 640×480 的 1.5 倍，横版整屏无黑边；竖版是 480×640 转进 640×480 画框，同样铺满。
+
 服务端只渲染真正有人在看的朝向，切换朝向不会增加负担。
 
 ## 设置页面
@@ -157,13 +193,14 @@ PC 端 `config.json`（`port` 只能在这里改，改完要重启服务）：
 | `port` | 8765 | 监听端口 |
 | `fps` | 8 | 帧率。约 33 KB/帧，8 fps ≈ 2.2 Mbps |
 | `jpeg_quality` | 72 | JPEG 质量 |
-| `rotate180` | true | 预旋转 180°，匹配 Miyoo 面板方向 |
+| `rotate180` | true | 预旋转 180°，匹配 Miyoo 面板方向。ROCKNIX 掌机会自己抵消掉，所以这个开关只影响 Miyoo |
 
-掌机端 `/mnt/SDCARD/App/PCMonitor/` 下：
+掌机端（Onion 在 `/mnt/SDCARD/App/PCMonitor/`，ROCKNIX 在
+`/storage/roms/ports/pcmonitor/`）：
 
 | 文件 | 作用 |
 |---|---|
-| `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率；`BATT_EVERY_S` / `BATT_LOW_PCT` / `BATT_BUZZ_GAP_S` 控制电量上报与震动 |
+| `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率；`BATT_EVERY_S` / `BATT_LOW_PCT` / `BATT_BUZZ_GAP_S` 控制电量上报与震动；ROCKNIX 多一个 `PANEL_FLIP` |
 | `hosts.txt` | 扫到的设备表，每行 `IP\|主机名`，自动维护 |
 | `state.cfg` | 上次选的 `IDX` 和 `ORIENT` |
 | `pcmonitor.log` | 本次运行的日志，每次启动清空 |
@@ -246,7 +283,7 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
 | 路径 | 内容 |
 |---|---|
 | `/` `/settings` | 设置页（POST 同一路径提交表单） |
-| `/stream.mjpg?orient=N&devs=a,b&i=K` | 裸 JPEG 连续流，给掌机的 ffplay。`orient` 0–3 决定版式与旋转（缺省 0）；`devs` 是掌机扫到的设备名，`i` 是当前序号，用来画顶栏的设备条（最多 8 台、单名 18 字符，超出截断） |
+| `/stream.mjpg?orient=N&devs=a,b&i=K` | 裸 JPEG 连续流，给掌机的播放器。`orient` 0–3 决定版式与旋转（缺省 0）；`devs` 是掌机扫到的设备名，`i` 是当前序号，用来画顶栏的设备条（最多 8 台、单名 18 字符，超出截断） |
 | `/preview.mjpg` | `multipart/x-mixed-replace`，给浏览器 |
 | `/preview` | 只有预览的页面 |
 | `/frame.jpg` | 当前单帧 |
@@ -256,7 +293,8 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
 
 ## 排查
 
-- **掌机黑屏**：说明连不上任何 PC。看 `/mnt/SDCARD/App/PCMonitor/pcmonitor.log`，
+- **掌机黑屏**：说明连不上任何 PC。看 `pcmonitor.log`（Onion 在
+  `/mnt/SDCARD/App/PCMonitor/`，ROCKNIX 在 `/storage/roms/ports/pcmonitor/`），
   里面会记 `discover: swept …, N port(s) open`、`discover: found N device(s)`、
   `connect <ip> idx=i/n orient=o rate=r`、`unreachable <ip>` 和 ffplay 的退出码。
   常见原因是服务没启动、掌机和 PC 不在同一网段、或 Windows 防火墙拦了。
@@ -287,6 +325,32 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
   Windows 上 `SO_REUSEADDR` 允许第二个进程绑同一个端口，请求会随机落到其中一个
   socket 上——所以这里显式关掉了地址复用。看到这个报错就是已经有一份在跑了。
 
+### ROCKNIX 专有
+
+这几条都是移植时踩过的坑，写在这里免得下次再踩。**ROCKNIX 上 `$PATH` 里是 GNU
+coreutils 而不是 busybox applet**，所以从 Onion 抄过来的写法要逐条验证。
+
+- **按键全都没反应**：多半是 `timeout -t 2` 这种 busybox 写法。GNU 的 `timeout`
+  没有 `-t`，直接以 125 退出，读键循环就变成什么都不读的空转。写成 `timeout 2`。
+  日志里每一次按键都会记一行 `btn N -> 动作`，没绑定的记 `btn N (unbound)`——
+  想换键位就照着日志里的编号改脚本顶部的 `JSBTN_*`。
+- **按键偶尔错乱**：`od` 会把和上一行完全相同的一行折叠成 `*`，按位置取字段就
+  全错位了。读 js 事件必须带 `-v`。
+- **画面方向不对**：按 **Y** 转，四档里总有一档是正的，转到对为止就记住了
+  （存在 `state.cfg`）。如果四档全都差同样的 180°，那是面板倒装，把 `settings.cfg`
+  里的 `PANEL_FLIP` 设成 1。
+- **按左右键换台时画面突然倒过来**：说明各台 PC 的 `rotate180` 不一致，而掌机没有
+  逐台重算抵消。日志每行 `connect` 都记了 `orient=` / `send=` / `srv_flip=`，
+  `send` 应当随 `srv_flip` 变化而变化。
+- **一片黑但日志显示在连接**：mpv 找不到 Wayland。它在这个固件上是 Vulkan-on-
+  Wayland（编译时关了 EGL），没有合成器就直接退出。脚本会自己在
+  `$XDG_RUNTIME_DIR` 里找 `wayland-*` socket（这台是 `wayland-1`，不是常见的
+  `wayland-0`），日志开头的 `display=` 就是它找到的那个。
+- **每次扫描都闪一下**：ROCKNIX 既没有 `cmp` 也没有 `diff`，命令不存在返回非零，
+  被当成"设备列表变了"于是重连。改成在 shell 里比字符串。
+- **退出**：ROCKNIX 没给 ports 配组合键强杀，所以 **SELECT 是唯一的出口**。
+- 电量走标准的 `/sys/class/power_supply/battery`（rk817 PMIC）。
+
 ## 已知限制
 
 - **CPU 温度和功耗依赖 MSI Afterburner 在运行**。建议把 Afterburner 设成开机启动，
@@ -300,3 +364,8 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
   `IP|名字`（下一次扫描出结果时会被覆盖）。
 - 按键之间隔得太近（不到约 2 秒）时，后一次按键会覆盖前一次还没被处理的那次——
   切流本身要 1–2 秒，这里就按"最后一次按键生效"处理，没有做按键队列。
+- **ROCKNIX 上没有低电量震动**。手柄本身有力反馈（`/proc/bus/input/devices` 里
+  能看到 `FF=`），但触发一次效果要下 ioctl，shell 脚本做不到；电量照常显示在顶栏。
+- **ROCKNIX 上切设备/转屏比 Miyoo 慢一点**（约 1–2 秒）。mpv 每次启动要现编
+  Vulkan 管线，日志里是 `Spent … ms translating SPIR-V`。这个固件的 mpv 关掉了
+  EGL，所以换不成更轻的 OpenGL 后端。
