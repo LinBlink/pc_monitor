@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 import psutil
 
 import paths
+import perfcounters
 import rtss
 import sensors
 
@@ -119,135 +120,98 @@ class GpuPoller(threading.Thread):
                             temp_c=num(parts[4]), power_w=num(parts[5]), ok=True)
 
 
-_PROC_SCRIPT = r"""
-$ErrorActionPreference='SilentlyContinue'
-# Counter names are localised, so translate the well-known PDH indexes through the
-# registry instead of hard-coding English paths.
-$perf = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib'
-$en = (Get-ItemProperty "$perf\009" -Name Counter).Counter
-$loc = (Get-ItemProperty "$perf\CurrentLanguage" -Name Counter).Counter
-if (-not $loc) { $loc = $en }
-$byName = @{}
-for ($i = 0; $i -lt $en.Count - 1; $i += 2) {
-    if (-not $byName.ContainsKey($en[$i + 1])) { $byName[$en[$i + 1]] = $en[$i] }
+_PROC_PATHS = {
+    "cpu": r"\Process(*)\% Processor Time",
+    "gpu": r"\GPU Engine(*)\Utilization Percentage",
 }
-$byIndex = @{}
-for ($i = 0; $i -lt $loc.Count - 1; $i += 2) { $byIndex[$loc[$i]] = $loc[$i + 1] }
-function Local-Name($english) {
-    $idx = $byName[$english]
-    if ($idx -and $byIndex[$idx]) { return $byIndex[$idx] } else { return $english }
-}
-$cpuPath = "\$(Local-Name 'Process')(*)\$(Local-Name '% Processor Time')"
-$gpuPath = "\$(Local-Name 'GPU Engine')(*)\$(Local-Name 'Utilization Percentage')"
-$n = [Environment]::ProcessorCount
-
-while ($true) {
-    $c = (Get-Counter $cpuPath).CounterSamples
-    if ($c) {
-        $c | Where-Object { $_.InstanceName -ne '_total' -and $_.InstanceName -ne 'idle' } |
-            Group-Object { $_.InstanceName -replace '#\d+$', '' } | ForEach-Object {
-                $v = (($_.Group | Measure-Object CookedValue -Sum).Sum) / $n
-                if ($v -gt 0.1) { "C $($_.Name) $([math]::Round($v, 2))" }
-            }
-    }
-    $g = (Get-Counter $gpuPath).CounterSamples
-    if ($g) {
-        $g | Group-Object { ($_.InstanceName -split '_')[1] } | ForEach-Object {
-            $v = ($_.Group | Measure-Object CookedValue -Sum).Sum
-            if ($v -gt 0.05) { "G $($_.Name) $([math]::Round($v, 2))" }
-        }
-    }
-    '---'
-    [Console]::Out.Flush()
-    Start-Sleep -Seconds __INTERVAL__
-}
-"""
 
 
 class ProcPoller(threading.Thread):
-    """Top CPU and GPU consumers, sampled by a PowerShell child process.
+    """Top CPU and GPU consumers, sampled through PDH directly.
 
-    This used to walk ``psutil.process_iter`` in-process. On a machine with ~400
-    processes that walk takes one to three seconds and holds the GIL long enough to
-    stall the frame thread: the dashboard visibly froze every few seconds even at
-    2 fps. Performance counters answer both questions with one query each, and
-    running them in a child process keeps the cost off the frame thread entirely —
-    this thread only ever parses short lines.
+    The previous version spawned a PowerShell child that called Get-Counter
+    twice per cycle. Get-Counter wraps every one of ~500 GPU-engine instances
+    in a rich .NET object, which cost ~2.5 seconds of CPU per sample — enough
+    to push our own helper to the top of the CPU list. PDH returns the same
+    data in a few milliseconds, so the heavy work happens in C and this
+    thread only does aggregation.
 
-    CPU comes from ``\\Process(*)\\% Processor Time``, summed over a name's
-    instances (``chrome``, ``chrome#1``, …) and divided by the core count so it
-    reads as a share of the whole machine. GPU comes from
-    ``\\GPU Engine(*)\\Utilization Percentage``, whose instances are named
-    ``pid_1234_luid_..._engtype_3D``; summing a process's engines gives the figure
-    people recognise from Task Manager's GPU column, and unlike ``nvidia-smi pmon``
-    it is vendor-neutral and counts graphics work, not just compute.
+    CPU comes from ``\\Process(*)\\% Processor Time``: instances are named
+    after the process with a ``#N`` suffix for duplicates. Summing them and
+    dividing by the core count gives a share of the whole machine.
 
-    Get-Counter re-enumerates instances every sample, so processes that start later
-    still appear — which ``typeperf`` with a wildcard would not do.
+    GPU comes from ``\\GPU Engine(*)\\Utilization Percentage``: instances are
+    named ``pid_PID_luid_..._engtype_TYPE``, so several engines per process
+    have to be summed by PID. The result matches Task Manager's GPU column
+    and, unlike ``nvidia-smi pmon``, counts graphics work, not just compute.
+
+    English counter paths work on every locale via ``PdhAddEnglishCounterW``,
+    so no registry name translation is needed.
     """
 
     def __init__(self, interval_s: float = 2.0, count: int = 3):
         super().__init__(daemon=True)
-        self.interval_s = max(1, int(interval_s))
+        self.interval_s = max(0.5, float(interval_s))
         self.count = count
         self.cpu_top: list[tuple[str, float]] = []
         self.gpu_top: list[tuple[str, float]] = []
         self.ok = False
         self._stop = threading.Event()
+        self._ncpu = max(1, psutil.cpu_count(logical=True) or 1)
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
-        script = _PROC_SCRIPT.replace("__INTERVAL__", str(self.interval_s))
-        while not self._stop.is_set():
-            proc = None
-            try:
-                proc = subprocess.Popen(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     script],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                cpu: list[tuple[str, float]] = []
-                gpu: list[tuple[str, float]] = []
-                for line in proc.stdout:
-                    if self._stop.is_set():
-                        break
-                    line = line.strip()
-                    if line == "---":
-                        self._publish(cpu, gpu)
-                        cpu, gpu = [], []
-                        continue
-                    kind, _, rest = line.partition(" ")
-                    name, _, value = rest.rpartition(" ")
-                    try:
-                        parsed = (name, float(value))
-                    except ValueError:
-                        continue
-                    if kind == "C":
-                        cpu.append(parsed)
-                    elif kind == "G":
-                        gpu.append(parsed)
-            except (OSError, ValueError):
-                self.ok = False
-            finally:
-                if proc and proc.poll() is None:
-                    proc.kill()
-            if not self._stop.wait(5.0):
+        try:
+            query = perfcounters.CounterQuery(_PROC_PATHS)
+        except perfcounters.PdhError:
+            return
+
+        try:
+            while not self._stop.is_set():
+                t0 = time.monotonic()
+                data = query.collect()
+                self._publish(data)
+                wait = self.interval_s - (time.monotonic() - t0)
+                if wait > 0:
+                    self._stop.wait(wait)
+        finally:
+            query.close()
+
+    def _publish(self, data: dict[str, list[tuple[str, float]]]) -> None:
+        cpu_by_name: dict[str, float] = {}
+        for instance, value in data.get("cpu", []):
+            if instance in ("_Total", "_total", "Idle", "idle"):
                 continue
+            base = instance.rsplit("#", 1)[0] if "#" in instance else instance
+            cpu_by_name[base] = cpu_by_name.get(base, 0.0) + value
+        self.cpu_top = [(name, min(value / self._ncpu, 100.0))
+                        for name, value in
+                        sorted(cpu_by_name.items(),
+                               key=lambda r: r[1], reverse=True)[:self.count]]
 
-    def _publish(self, cpu: list, gpu: list) -> None:
-        self.cpu_top = [(n, min(v, 100.0)) for n, v in
-                        sorted(cpu, key=lambda r: r[1], reverse=True)[:self.count]]
+        gpu_by_pid: dict[int, float] = {}
+        for instance, value in data.get("gpu", []):
+            parts = instance.split("_", 2)
+            if len(parts) < 2 or parts[0] != "pid":
+                continue
+            try:
+                pid = int(parts[1])
+            except ValueError:
+                continue
+            gpu_by_pid[pid] = gpu_by_pid.get(pid, 0.0) + value
 
-        rows = []
-        for pid, pct in sorted(gpu, key=lambda r: r[1], reverse=True):
+        # Cap the psutil lookups so a batch of exited processes can't drag us
+        # through every PID in the list.
+        rows: list[tuple[str, float]] = []
+        candidates = sorted(gpu_by_pid.items(),
+                            key=lambda r: r[1], reverse=True)
+        for pid, pct in candidates[:self.count * 4]:
             if len(rows) >= self.count:
                 break
             try:
-                # The CPU list comes from counter instance names, which carry no
-                # ".exe" — drop it here too so the two tables read alike.
-                name = psutil.Process(int(pid)).name()
+                name = psutil.Process(pid).name()
             except (psutil.Error, ValueError):
                 continue  # exited between the counter read and now
             if name.lower().endswith(".exe"):

@@ -5,9 +5,9 @@
 
 The result is ``dist/PCMonitor.exe`` and needs nothing installed on the machine it
 runs on — no Python, no psutil, no Pillow. It still uses the system's own tools
-where they exist (``nvidia-smi`` for GPU, PowerShell for the GPU-per-process
-counters, Windows' fonts), and reads config.json / traffic.json from the folder
-the exe sits in.
+where they exist (``nvidia-smi`` for GPU stats, Windows' PDH counters for the
+per-process view, Windows' fonts), and reads config.json / traffic.json from the
+folder the exe sits in.
 
 Deliberately excluded: paramiko and the device/ folder. Deploying to the handheld
 is a one-time job from the development machine, and the handheld finds new PCs by
