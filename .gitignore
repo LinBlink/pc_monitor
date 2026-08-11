@@ -1,0 +1,15 @@
+# Build output
+build/
+dist/
+*.spec
+version_info.txt
+app.ico
+
+# Runtime state, written next to the program
+config.json
+traffic.json
+srv.log
+srv.err
+
+__pycache__/
+*.pyc

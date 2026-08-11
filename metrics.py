@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 import psutil
 
+import paths
 import rtss
 import sensors
 
@@ -118,33 +119,79 @@ class GpuPoller(threading.Thread):
                             temp_c=num(parts[4]), power_w=num(parts[5]), ok=True)
 
 
-class GpuProcPoller(threading.Thread):
-    """Top GPU consumers, from the same counters Task Manager uses.
+_PROC_SCRIPT = r"""
+$ErrorActionPreference='SilentlyContinue'
+# Counter names are localised, so translate the well-known PDH indexes through the
+# registry instead of hard-coding English paths.
+$perf = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib'
+$en = (Get-ItemProperty "$perf\009" -Name Counter).Counter
+$loc = (Get-ItemProperty "$perf\CurrentLanguage" -Name Counter).Counter
+if (-not $loc) { $loc = $en }
+$byName = @{}
+for ($i = 0; $i -lt $en.Count - 1; $i += 2) {
+    if (-not $byName.ContainsKey($en[$i + 1])) { $byName[$en[$i + 1]] = $en[$i] }
+}
+$byIndex = @{}
+for ($i = 0; $i -lt $loc.Count - 1; $i += 2) { $byIndex[$loc[$i]] = $loc[$i + 1] }
+function Local-Name($english) {
+    $idx = $byName[$english]
+    if ($idx -and $byIndex[$idx]) { return $byIndex[$idx] } else { return $english }
+}
+$cpuPath = "\$(Local-Name 'Process')(*)\$(Local-Name '% Processor Time')"
+$gpuPath = "\$(Local-Name 'GPU Engine')(*)\$(Local-Name 'Utilization Percentage')"
+$n = [Environment]::ProcessorCount
 
-    ``\\GPU Engine(*)\\Utilization Percentage`` has one instance per process and
-    engine, named ``pid_1234_luid_..._engtype_3D``. Summing a process's engines
-    gives the figure people recognise from Task Manager's GPU column, and unlike
-    ``nvidia-smi pmon`` it is vendor-neutral and lists graphics work, not just
-    compute. Get-Counter re-enumerates instances every sample, so processes that
-    start later still appear — which ``typeperf`` with a wildcard would not do.
+while ($true) {
+    $c = (Get-Counter $cpuPath).CounterSamples
+    if ($c) {
+        $c | Where-Object { $_.InstanceName -ne '_total' -and $_.InstanceName -ne 'idle' } |
+            Group-Object { $_.InstanceName -replace '#\d+$', '' } | ForEach-Object {
+                $v = (($_.Group | Measure-Object CookedValue -Sum).Sum) / $n
+                if ($v -gt 0.1) { "C $($_.Name) $([math]::Round($v, 2))" }
+            }
+    }
+    $g = (Get-Counter $gpuPath).CounterSamples
+    if ($g) {
+        $g | Group-Object { ($_.InstanceName -split '_')[1] } | ForEach-Object {
+            $v = ($_.Group | Measure-Object CookedValue -Sum).Sum
+            if ($v -gt 0.05) { "G $($_.Name) $([math]::Round($v, 2))" }
+        }
+    }
+    '---'
+    [Console]::Out.Flush()
+    Start-Sleep -Seconds __INTERVAL__
+}
+"""
+
+
+class ProcPoller(threading.Thread):
+    """Top CPU and GPU consumers, sampled by a PowerShell child process.
+
+    This used to walk ``psutil.process_iter`` in-process. On a machine with ~400
+    processes that walk takes one to three seconds and holds the GIL long enough to
+    stall the frame thread: the dashboard visibly froze every few seconds even at
+    2 fps. Performance counters answer both questions with one query each, and
+    running them in a child process keeps the cost off the frame thread entirely —
+    this thread only ever parses short lines.
+
+    CPU comes from ``\\Process(*)\\% Processor Time``, summed over a name's
+    instances (``chrome``, ``chrome#1``, …) and divided by the core count so it
+    reads as a share of the whole machine. GPU comes from
+    ``\\GPU Engine(*)\\Utilization Percentage``, whose instances are named
+    ``pid_1234_luid_..._engtype_3D``; summing a process's engines gives the figure
+    people recognise from Task Manager's GPU column, and unlike ``nvidia-smi pmon``
+    it is vendor-neutral and counts graphics work, not just compute.
+
+    Get-Counter re-enumerates instances every sample, so processes that start later
+    still appear — which ``typeperf`` with a wildcard would not do.
     """
-
-    SCRIPT = (
-        "$ErrorActionPreference='SilentlyContinue';"
-        "while($true){"
-        " $s=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage').CounterSamples;"
-        " if($s){"
-        "  $s | Group-Object {($_.InstanceName -split '_')[1]} | ForEach-Object {"
-        "   $v=($_.Group | Measure-Object CookedValue -Sum).Sum;"
-        "   if($v -gt 0.05){ \"$($_.Name) $([math]::Round($v,2))\" } } }"
-        " '---'; [Console]::Out.Flush(); Start-Sleep -Seconds %d }"
-    )
 
     def __init__(self, interval_s: float = 2.0, count: int = 3):
         super().__init__(daemon=True)
         self.interval_s = max(1, int(interval_s))
         self.count = count
-        self.top: list[tuple[str, float]] = []
+        self.cpu_top: list[tuple[str, float]] = []
+        self.gpu_top: list[tuple[str, float]] = []
         self.ok = False
         self._stop = threading.Event()
 
@@ -152,28 +199,35 @@ class GpuProcPoller(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
+        script = _PROC_SCRIPT.replace("__INTERVAL__", str(self.interval_s))
         while not self._stop.is_set():
             proc = None
             try:
                 proc = subprocess.Popen(
                     ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     self.SCRIPT % self.interval_s],
+                     script],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                batch: list[tuple[int, float]] = []
+                cpu: list[tuple[str, float]] = []
+                gpu: list[tuple[str, float]] = []
                 for line in proc.stdout:
                     if self._stop.is_set():
                         break
                     line = line.strip()
                     if line == "---":
-                        self._publish(batch)
-                        batch = []
+                        self._publish(cpu, gpu)
+                        cpu, gpu = [], []
                         continue
-                    pid, _, value = line.partition(" ")
+                    kind, _, rest = line.partition(" ")
+                    name, _, value = rest.rpartition(" ")
                     try:
-                        batch.append((int(pid), float(value)))
+                        parsed = (name, float(value))
                     except ValueError:
                         continue
+                    if kind == "C":
+                        cpu.append(parsed)
+                    elif kind == "G":
+                        gpu.append(parsed)
             except (OSError, ValueError):
                 self.ok = False
             finally:
@@ -182,16 +236,24 @@ class GpuProcPoller(threading.Thread):
             if not self._stop.wait(5.0):
                 continue
 
-    def _publish(self, batch: list[tuple[int, float]]) -> None:
+    def _publish(self, cpu: list, gpu: list) -> None:
+        self.cpu_top = [(n, min(v, 100.0)) for n, v in
+                        sorted(cpu, key=lambda r: r[1], reverse=True)[:self.count]]
+
         rows = []
-        for pid, pct in sorted(batch, key=lambda r: r[1], reverse=True):
+        for pid, pct in sorted(gpu, key=lambda r: r[1], reverse=True):
             if len(rows) >= self.count:
                 break
             try:
-                rows.append((psutil.Process(pid).name(), min(pct, 100.0)))
+                # The CPU list comes from counter instance names, which carry no
+                # ".exe" — drop it here too so the two tables read alike.
+                name = psutil.Process(int(pid)).name()
             except (psutil.Error, ValueError):
                 continue  # exited between the counter read and now
-        self.top = rows
+            if name.lower().endswith(".exe"):
+                name = name[:-4]
+            rows.append((name, min(pct, 100.0)))
+        self.gpu_top = rows
         self.ok = True
 
 
@@ -250,45 +312,7 @@ class DailyTraffic:
             self._save()
 
 
-class TopProcPoller(threading.Thread):
-    """Top CPU consumers, refreshed slowly — a full process walk is not cheap."""
-
-    def __init__(self, interval_s: float = 3.0, count: int = 3):
-        super().__init__(daemon=True)
-        self.interval_s = interval_s
-        self.count = count
-        self.top: list[tuple[str, float]] = []
-        self._stop = threading.Event()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def run(self) -> None:
-        ncpu = psutil.cpu_count() or 1
-        for p in psutil.process_iter(["name"]):
-            try:
-                p.cpu_percent(None)
-            except psutil.Error:
-                pass
-        while not self._stop.wait(self.interval_s):
-            rows: list[tuple[str, float]] = []
-            for p in psutil.process_iter(["name"]):
-                if p.pid == 0:  # "System Idle Process" is not a consumer
-                    continue
-                try:
-                    pct = p.cpu_percent(None) / ncpu
-                except psutil.Error:
-                    continue
-                # pct is a share of the whole machine, so the floor has to be low
-                # enough to still surface something on a mostly idle box.
-                if pct > 0.1:
-                    rows.append((p.info.get("name") or "?", pct))
-            rows.sort(key=lambda r: r[1], reverse=True)
-            self.top = rows[: self.count]
-
-
-TRAFFIC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "traffic.json")
+TRAFFIC_PATH = os.path.join(paths.base_dir(), "traffic.json")
 
 
 class Collector:
@@ -315,10 +339,8 @@ class Collector:
 
         self.gpu = GpuPoller()
         self.gpu.start()
-        self.procs = TopProcPoller()
+        self.procs = ProcPoller()
         self.procs.start()
-        self.gpu_procs = GpuProcPoller()
-        self.gpu_procs.start()
 
         self._rtss_checked = 0.0
         self._rtss_up = False
@@ -330,7 +352,6 @@ class Collector:
     def close(self) -> None:
         self.gpu.stop()
         self.procs.stop()
-        self.gpu_procs.stop()
 
     @staticmethod
     def _cpu_name() -> str:
@@ -463,8 +484,8 @@ class Collector:
                 "process": fps.process if fps else None,
                 "hist": self.fps_hist.list(),
             },
-            "top": list(self.procs.top),
-            "gpu_top": list(self.gpu_procs.top),
+            "top": list(self.procs.cpu_top),
+            "gpu_top": list(self.procs.gpu_top),
         }
 
 

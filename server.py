@@ -39,10 +39,10 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import metrics
+import paths
 import render
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "config.json")
+CONFIG_PATH = os.path.join(paths.base_dir(), "config.json")
 
 DEFAULTS = {
     "port": 8765,
@@ -270,12 +270,16 @@ class FrameSource(threading.Thread):
                     panel[0] if panel else next(iter(variants.values())))
                 self._cv.notify_all()
 
+            # Even spacing matters more than frame count: ffplay is started with a
+            # fixed -framerate and has no timestamps to resynchronise from, so a
+            # burst of catch-up frames after a slow cycle reads as a stutter. Skip
+            # the slots that were missed instead of firing them back to back.
             next_at += interval
-            delay = next_at - time.monotonic()
-            if delay < -1.0:  # fell far behind (machine was asleep) — resync
-                next_at = time.monotonic()
-            elif delay > 0:
-                self._stop.wait(delay)
+            now2 = time.monotonic()
+            if next_at < now2:
+                missed = int((now2 - next_at) / interval) + 1
+                next_at += missed * interval
+            self._stop.wait(max(0.0, next_at - time.monotonic()))
         self.collector.close()
 
 
@@ -651,12 +655,63 @@ def lan_ips() -> list[str]:
     return out
 
 
+def startup_shortcut() -> str:
+    appdata = os.environ.get("APPDATA", "")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
+                        "Programs", "Startup", "PC Monitor.cmd")
+
+
+def install_autostart(remove: bool = False) -> int:
+    """Add or remove a per-user startup entry. No admin rights involved.
+
+    A .cmd that launches the program and exits is used rather than a .lnk: making
+    a shortcut needs COM, and this has to work from a frozen exe with no extra
+    dependencies. `start` hands off and returns, so nothing lingers.
+    """
+    link = startup_shortcut()
+    if not os.environ.get("APPDATA"):
+        print("APPDATA is not set — cannot find the Startup folder.")
+        return 1
+
+    if remove:
+        if os.path.exists(link):
+            os.remove(link)
+            print(f"removed {link}")
+        else:
+            print("nothing to remove.")
+        return 0
+
+    if paths.frozen():
+        target = f'"{os.path.abspath(sys.executable)}"'
+    else:
+        target = (f'"{os.path.abspath(sys.executable)}" '
+                  f'"{os.path.abspath(__file__)}"')
+    try:
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        with open(link, "w", encoding="mbcs") as fh:
+            fh.write("@echo off\r\n")
+            fh.write(f'cd /d "{paths.base_dir()}"\r\n')
+            fh.write(f"start \"PC Monitor\" {target}\r\n")
+    except OSError as exc:
+        print(f"could not write {link}: {exc}")
+        return 1
+    print(f"installed {link}\n  runs: {target}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="PC telemetry MJPEG server")
     ap.add_argument("--port", type=int)
     ap.add_argument("--save", metavar="PNG",
                     help="render one frame to a file and exit")
+    ap.add_argument("--install-autostart", action="store_true",
+                    help="run automatically when this user logs in")
+    ap.add_argument("--remove-autostart", action="store_true",
+                    help="undo --install-autostart")
     args = ap.parse_args()
+
+    if args.install_autostart or args.remove_autostart:
+        return install_autostart(remove=args.remove_autostart)
 
     settings = Settings(CONFIG_PATH)
     port = args.port or int(settings.get("port"))
@@ -697,6 +752,9 @@ def main() -> int:
     for ip in lan_ips():
         print(f"  settings     : http://{ip}:{port}/settings")
         print(f"  handheld URL : http://{ip}:{port}/stream.mjpg")
+    print(f"  config       : {CONFIG_PATH}")
+    if paths.frozen() and not os.path.exists(startup_shortcut()):
+        print("  tip          : --install-autostart 可开机自启")
     print("Ctrl+C to stop.", flush=True)
 
     try:

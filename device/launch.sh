@@ -56,8 +56,6 @@ export SDL_AUDIODRIVER=dummy
 export HOME=/mnt/SDCARD
 
 : > "$log"
-: > "$cmdfile"
-rm -f "$stopflag"
 
 say() { echo "$(date '+%H:%M:%S') $*" >> "$log"; }
 
@@ -272,6 +270,42 @@ play() {
 	return $rc
 }
 
+# --- stream watchdog -------------------------------------------------------
+# ffplay does not reliably notice a stream that died under it: when the PC's
+# server exits, or WiFi drops, the socket goes away but ffplay can sit spinning on
+# a frozen frame forever — and the main loop is blocked in `wait`, so nothing
+# reconnects until the user quits the app.
+#
+# The kernel knows the truth, so look for an established connection to the PC's
+# port in /proc/net/tcp and kill the player when there has been none for two
+# checks running. The main loop then reconnects on its own. Two checks rather than
+# one because the connection is legitimately absent for an instant between
+# reconnects, and one check may also catch the battery reporter's own short-lived
+# connection either way.
+PORT_HEX=$(printf '%04X' "$PC_PORT")
+
+stream_connected() {
+	awk -v p=":$PORT_HEX\$" '$4 == "01" && $3 ~ p { found = 1 } END { exit !found }' \
+		/proc/net/tcp 2>/dev/null
+}
+
+watchdog() {
+	misses=0
+	while [ ! -f "$stopflag" ]; do
+		sleep 10
+		if [ ! -s "$pidfile" ] || stream_connected; then
+			misses=0
+			continue
+		fi
+		misses=$((misses + 1))
+		if [ "$misses" -ge 2 ]; then
+			misses=0
+			say "watchdog: no stream connection, restarting player"
+			kill -9 "$(cat "$pidfile")" 2>/dev/null
+		fi
+	done
+}
+
 cleanup() {
 	touch "$stopflag"
 	rm -f /tmp/stay_awake "$selfpid"
@@ -279,6 +313,7 @@ cleanup() {
 	[ -n "$KR_PID" ] && kill "$KR_PID" 2>/dev/null
 	[ -n "$DISC_PID" ] && kill "$DISC_PID" 2>/dev/null
 	[ -n "$BATT_PID" ] && kill "$BATT_PID" 2>/dev/null
+	[ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null
 	rm -f "$targetfile"
 	echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 }
@@ -297,6 +332,13 @@ if [ -s "$selfpid" ]; then
 fi
 echo "$$" > "$selfpid"
 
+# Only now: the /tmp flags are shared between instances, and the previous one sets
+# the stop flag as it exits. Clearing these before that happened would hand the
+# flag straight to this instance's own helpers, which would exit immediately and
+# leave the app running with no buttons and no battery reports.
+: > "$cmdfile"
+rm -f "$stopflag"
+
 echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 touch /tmp/stay_awake
 
@@ -310,6 +352,11 @@ discover &
 DISC_PID=$!
 battery_loop &
 BATT_PID=$!
+# The stub player holds no socket, so the watchdog would kill it on sight.
+if [ -z "$PCMON_TEST_PLAY" ]; then
+	watchdog &
+	WD_PID=$!
+fi
 
 say "start idx=$IDX orient=$ORIENT"
 

@@ -54,30 +54,40 @@ CHIP_H = 20
 CHIP_GAP = 6
 ARROW_W = 13
 
-_FONT_BOLD = "C:/Windows/Fonts/msyhbd.ttc"
-_FONT_REG = "C:/Windows/Fonts/msyh.ttc"
+# Candidates in preference order. The labels are Chinese, so a CJK face has to
+# come first; the rest are fallbacks for machines that lack the YaHei collections
+# (Windows Server installs, N editions). Nothing is bundled: these faces are not
+# ours to redistribute.
+_FONTS_BOLD = ("C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyh.ttc",
+               "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/Deng.ttf",
+               "C:/Windows/Fonts/arialbd.ttf")
+_FONTS_REG = ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+              "C:/Windows/Fonts/Deng.ttf", "C:/Windows/Fonts/arial.ttf")
 
 
-def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
-    # Index 1 of the YaHei collections is the "UI" face; older copies lack it.
-    try:
-        return ImageFont.truetype(path, size, index=1)
-    except (OSError, ValueError):
-        return ImageFont.truetype(path, size, index=0)
+def _font(candidates: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont:
+    for path in candidates:
+        # Index 1 of the YaHei collections is the "UI" face; older copies lack it.
+        for index in (1, 0):
+            try:
+                return ImageFont.truetype(path, size, index=index)
+            except (OSError, ValueError):
+                continue
+    return ImageFont.load_default(size)
 
 
 class Fonts:
     def __init__(self):
-        self.hero = _font(_FONT_BOLD, 52)
-        self.hero_sm = _font(_FONT_BOLD, 40)
-        self.value = _font(_FONT_BOLD, 32)
-        self.value_sm = _font(_FONT_BOLD, 26)
-        self.value_xs = _font(_FONT_BOLD, 21)
-        self.label = _font(_FONT_BOLD, 15)
-        self.row = _font(_FONT_BOLD, 13)
-        self.sub = _font(_FONT_REG, 13)
-        self.meta = _font(_FONT_REG, 12)
-        self.tiny = _font(_FONT_REG, 11)
+        self.hero = _font(_FONTS_BOLD, 52)
+        self.hero_sm = _font(_FONTS_BOLD, 40)
+        self.value = _font(_FONTS_BOLD, 32)
+        self.value_sm = _font(_FONTS_BOLD, 26)
+        self.value_xs = _font(_FONTS_BOLD, 21)
+        self.label = _font(_FONTS_BOLD, 15)
+        self.row = _font(_FONTS_BOLD, 13)
+        self.sub = _font(_FONTS_REG, 13)
+        self.meta = _font(_FONTS_REG, 12)
+        self.tiny = _font(_FONTS_REG, 11)
 
 
 def blend(fg, bg, alpha: float):

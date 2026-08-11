@@ -25,17 +25,42 @@ GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用�
 | `preview.py` | 用假数据出图，改版式时看效果 |
 | `make_icon.py` | 生成掌机启动器图标 |
 | `deploy_device.py` | 把掌机端推送到 `/mnt/SDCARD/App/PCMonitor` |
+| `paths.py` | 区分「exe 旁边的可写文件」和「打包进去的只读文件」 |
+| `build_exe.py` | 打包成单文件 `dist/PCMonitor.exe` |
 | `device/` | 掌机端：`launch.sh` / `config.json` / `settings.cfg` |
 
-## 依赖
+## 用 exe 跑（推荐，换机器不用装环境）
+
+```
+python -m pip install pyinstaller
+python build_exe.py
+```
+
+产出 `dist/PCMonitor.exe`（单文件，约 17 MB）。**复制到任何 Windows 机器上双击即可**，
+不需要装 Python / psutil / Pillow。
+
+- `config.json`、`traffic.json` 会生成在 **exe 所在目录**（不是临时目录——打包后
+  `__file__` 指向一个退出即删的解包目录，所以这两个路径走 `paths.base_dir()`）。
+  换句话说，exe 放哪儿，配置和当日流量就存哪儿。
+- 开机自启：`PCMonitor.exe --install-autostart`，取消用 `--remove-autostart`。
+  它在「启动」文件夹里写一个 `PC Monitor.cmd`，不需要管理员权限。
+- 换端口：`PCMonitor.exe --port 8888`（或改 `config.json` 里的 `port`）。
+- 首次运行 Windows SmartScreen 可能提示未知发布者——exe 没有代码签名，选「仍要运行」。
+
+**仍然依赖系统里已有的东西**（这些不可能打包进去）：`nvidia-smi`（GPU）、PowerShell
+（GPU 进程排行的性能计数器）、系统字体、以及可选的 MSI Afterburner / RTSS。
+字体按 `msyhbd → msyh → simhei → Deng → arial` 依次回退，所以缺字体也不会崩。
+
+**exe 里不含 paramiko 和 `device/`**：往掌机部署是开发机上的一次性动作，而掌机是靠扫
+网段自己找 PC 的——新机器只要把 exe 跑起来就会被发现。
+
+## 从源码跑
 
 ```
 python -m pip install psutil pillow paramiko
 ```
 
 `paramiko` 只在部署到掌机时需要。
-
-## 使用
 
 1. **PC 端启动**：双击 `start.bat`，或 `python server.py`。
    启动时会打印地址：
@@ -47,13 +72,7 @@ python -m pip install psutil pillow paramiko
 
    浏览器打开 `settings` 那条即可调设置并实时预览（手机上也能开）。
 
-2. **开机自启**（推荐，这样掌机随时打开都有画面）：
-
-   ```
-   powershell -ExecutionPolicy Bypass -File autostart.ps1 -Install
-   ```
-
-   卸载用 `-Remove`。
+2. **开机自启**：`python server.py --install-autostart`（和 exe 是同一套机制）。
 
 3. **掌机端部署**（已经部署过就不用再跑）：
 
@@ -253,6 +272,13 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
   PC 端预旋转，省掉掌机的滤镜开销。
 
 - **画面卡顿 / 延迟增长**：设置页把刷新速率降到 5 或 2，或把画质降到 60。
+
+- **画面冻结在某一帧**：应该会自己恢复。ffplay 不一定能察觉流在它脚下断了——PC 上
+  的服务退出、或 WiFi 掉线时，socket 没了但 ffplay 可能一直转在最后一帧上，而主循环
+  正卡在 `wait` 上，谁也不会重连。所以掌机上有个看门狗：每 10 秒在 `/proc/net/tcp`
+  里找一条到 PC 端口的 ESTABLISHED 连接，连续两次找不到就杀掉播放器让主循环重连
+  （日志里是 `watchdog: no stream connection, restarting player`）。两次而不是一次，
+  是因为正常重连之间本来就有一瞬间没有连接。
 
 - **GPU 显示"未检测到"**：`nvidia-smi` 不在 PATH 或不是 NVIDIA 卡。本项目的 GPU
   数据只走 `nvidia-smi`（GPU 前三不受影响，它走性能计数器）。

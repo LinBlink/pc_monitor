@@ -1,21 +1,20 @@
 PC Monitor listening on port 8765 (8 fps, quality 72, rotate180=True)
   settings     : http://192.168.2.114:8765/settings
   handheld URL : http://192.168.2.114:8765/stream.mjpg
+  config       : C:\Users\wangb\Developer\LongLive\pcmon\config.json
 Ctrl+C to stop.
-[http] 127.0.0.1 GET /stream.mjpg?orient=0&devs=LinPro,StudioPC&i=0
 [http] 127.0.0.1 GET /settings
 [http] 127.0.0.1 GET /settings
-[http] 127.0.0.1 GET /preview.mjpg
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro,Fake&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 127.0.0.1 GET /settings
+[http] 192.168.2.5 GET /stream.mjpg?orient=0&devs=T&i=0
+[http] 192.168.2.5 GET /stream.mjpg?orient=0&devs=T&i=0
 [http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
 [http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
 [http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
 [http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
-[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=LinPro&i=0
+[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
+[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
+[http] 192.168.2.5 GET /stream.mjpg?orient=0&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
+[http] 192.168.2.5 GET /stream.mjpg?orient=0&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
+[http] 192.168.2.5 GET /stream.mjpg?orient=1&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
+[http] 192.168.2.5 GET /stream.mjpg?orient=2&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
+[http] 192.168.2.5 GET /stream.mjpg?orient=3&devs=1080TiBitch,DESKTOP-U3VG5HG,LinPro&i=2
