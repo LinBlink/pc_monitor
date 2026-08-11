@@ -40,6 +40,7 @@ MINIMAX_URLS = {
 
 CLAUDE_EVERY_S = 60.0
 BALANCE_EVERY_S = 300.0
+UNCONFIGURED_S = 15.0
 MAX_BACKOFF_S = 600.0
 # Refresh this far ahead of expiry rather than waiting for the 401.
 REFRESH_MARGIN_S = 300.0
@@ -123,11 +124,13 @@ class AiPoller(threading.Thread):
         except Exception as exc:  # a poller thread that dies stops the whole tile
             result, ok = {"ok": False, "err": str(exc)}, False
 
-        if result is None:  # provider not configured — drop it and stop polling
+        if result is None:  # no key configured — nothing to show, nothing to call
             self.data = dict(self.data, **{name: None})
             self.raw.pop(name, None)
             self._backoff[name] = 0.0
-            self._due[name] = time.monotonic() + every
+            # Come back soon rather than in five minutes: this costs no request,
+            # and it is what makes a freshly pasted key light up right away.
+            self._due[name] = time.monotonic() + UNCONFIGURED_S
             return
 
         if ok or self.data.get(name) is None:
@@ -302,23 +305,41 @@ class AiPoller(threading.Thread):
             return {"ok": False, "err": f"http {status}" if status else "offline"}, False
 
         self.raw["minimax"] = payload
-        # MiniMax reports what is *left*, so the used fraction the bars want is
-        # the complement. Field names vary by plan, hence the fallbacks.
-        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        five = _pct(_first(body, "interval_remain_percent", "interval_remain",
-                           "five_hour_remain_percent"))
-        week = _pct(_first(body, "weekly_remain_percent", "weekly_remain",
-                           "week_remain_percent"))
+        models = [m for m in (payload.get("model_remains") or [])
+                  if isinstance(m, dict)]
+        if not models:
+            return {"ok": False, "err": "no-models"}, False
+
+        # Quotas are per model group ("general" for text, "video", ...). The
+        # tile has room for one, so it takes the text quota — the one that runs
+        # out while you are working; /ai lists every group in full.
+        primary = next((m for m in models if m.get("model_name") == "general"),
+                       models[0])
         return {"ok": True, "err": None,
-                "five_hour": None if five is None else 100.0 - five,
-                "weekly": None if week is None else 100.0 - week}, True
+                "model": primary.get("model_name") or "",
+                "five_hour": _used(primary.get("current_interval_remaining_percent")),
+                "weekly": _used(primary.get("current_weekly_remaining_percent")),
+                "five_hour_reset": _ms(primary.get("end_time")),
+                "weekly_reset": _ms(primary.get("weekly_end_time")),
+                "models": [{"name": m.get("model_name") or "?",
+                            "five_hour": _used(m.get("current_interval_remaining_percent")),
+                            "weekly": _used(m.get("current_weekly_remaining_percent")),
+                            "five_hour_reset": _ms(m.get("end_time")),
+                            "weekly_reset": _ms(m.get("weekly_end_time"))}
+                           for m in models]}, True
 
 
-def _first(d: dict, *names):
-    for name in names:
-        if isinstance(d, dict) and d.get(name) is not None:
-            return d[name]
-    return None
+def _used(remaining) -> float | None:
+    """MiniMax reports what is *left*; every bar here is drawn from what is used."""
+    pct = _pct(remaining)
+    return None if pct is None else 100.0 - pct
+
+
+def _ms(value) -> float | None:
+    """MiniMax timestamps are epoch milliseconds."""
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return value / 1000.0
 
 
 if __name__ == "__main__":

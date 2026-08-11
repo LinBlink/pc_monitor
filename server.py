@@ -703,13 +703,21 @@ def ai_page(source: FrameSource) -> bytes:
     mm = ai.get("minimax")
     if not mm:
         mm_body = '<p class="hint">没有配置 API key。</p>'
-    elif not mm.get("ok") and mm.get("five_hour") is None:
+    elif not mm.get("models"):
         mm_body = f'<p class="hint">{html.escape(str(mm.get("err")))}</p>'
     else:
-        mm_body = (_quota_row("5 小时已用", None if mm.get("five_hour") is None
-                              else {"pct": mm["five_hour"]}) +
-                   _quota_row("本周已用", None if mm.get("weekly") is None
-                              else {"pct": mm["weekly"]}))
+        # Every model group, not just the one the tile has room for.
+        mm_body = ""
+        for model in mm["models"]:
+            name = html.escape(model["name"])
+            mm_body += (
+                f'<div class="hint" style="margin:16px 0 8px">{name}</div>' +
+                _quota_row("5 小时已用", None if model["five_hour"] is None else
+                           {"pct": model["five_hour"],
+                            "resets_at": model["five_hour_reset"]}) +
+                _quota_row("本周已用", None if model["weekly"] is None else
+                           {"pct": model["weekly"],
+                            "resets_at": model["weekly_reset"]}))
 
     if weather.get("ok"):
         def cell(title, block, key_a, key_b=None):

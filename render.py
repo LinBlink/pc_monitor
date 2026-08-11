@@ -434,8 +434,10 @@ def _ai_cells(ai: dict) -> list[tuple]:
 
     mm = ai.get("minimax") or {}
     for key, label in (("five_hour", "M 5h"), ("weekly", "M 周")):
-        value = mm.get(key) if mm.get("ok") else None
-        cells.append(_quota_cell(label, None if value is None else {"pct": value}))
+        value = mm.get(key)
+        cells.append(_quota_cell(
+            label, None if value is None else
+            {"pct": value, "resets_at": mm.get(key + "_reset")}))
     return cells
 
 
