@@ -4,7 +4,7 @@
 仪表盘，通过 WiFi 以 MJPEG 流推给掌机全屏显示。掌机会自己扫局域网找出所有能监控
 的 PC，左右键切换，Y 键转屏（支持竖屏），自己的电量也会显示在顶栏、低电量时震动。
 
-支持两类掌机，共用同一个 PC 端服务：
+支持三类掌机，共用同一个 PC 端服务：
 
 | 掌机 | 系统 | 播放器 | 部署位置 |
 |---|---|---|---|
@@ -14,11 +14,26 @@
 
 一屏包含：CPU 总占用 / 温度 / 功耗 / 每个逻辑核心的占用与实时频率、游戏 FPS、
 GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用前三的进程、网络实时
-上下行与当日累计流量、内存。
+上下行与当日累计流量、内存、掌机电量、天气（当前 + 未来 3 小时 / 6 小时 / 两天的
+温度和天气）、以及 AI 额度（Claude / DeepSeek / MiniMax 的用量条）。
 
 **为什么这么设计**：掌机是 ARMv7 双核、没有 python/lua/编译器，但自带 `ffplay`。
 所以让 PC 承担全部采集与绘图，掌机只解码一路 640×480 MJPEG——完全在 Cortex-A7
 的能力范围内，也不需要交叉编译任何东西。
+
+## 效果图
+
+`preview.py` 用假数据渲染的仪表盘，横 / 竖两套版式各一张（进游戏 / 平时）：
+
+| 横版 · 进游戏 | 横版 · 平时 |
+|---|---|
+| ![横版游戏](preview_landscape_game.png) | ![横版平时](preview_landscape_idle.png) |
+
+| 竖版 · 进游戏 | 竖版 · 平时 |
+|---|---|
+| ![竖版游戏](preview_portrait_game.png) | ![竖版平时](preview_portrait_idle.png) |
+
+> 这些图由 `python preview.py` 重新生成，方便改版式后第一时间肉眼检查。
 
 ## 组成
 
@@ -26,12 +41,16 @@ GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用�
 |---|---|
 | `server.py` | MJPEG 服务，帧生产线程 + HTTP 接口 |
 | `metrics.py` | 采集 CPU / 内存 / 网络 / GPU / 进程 / 当日流量 |
-| `rtss.py` | 从 RivaTuner 共享内存读游戏 FPS |
+| `perfcounters.py` | 通过 PDH 性能计数器读 CPU / GPU 各进程占用（带本地化处理） |
 | `sensors.py` | 从 MSI Afterburner 共享内存读 CPU 温度 / 功耗 / 每核频率 |
+| `rtss.py` | 从 RivaTuner 共享内存读游戏 FPS |
+| `weather.py` | 天气：公网 IP 定位 / 城市名解析 / 经纬度，Open-Meteo 免费接口 |
+| `aiquota.py` | 轮询 Claude / DeepSeek / MiniMax 的额度与余额 |
+| `webjson.py` | 共享的 HTTP GET + JSON 小助手 |
 | `render.py` | Pillow 绘制仪表盘（横/竖两套版式 + 旋转 + 180° 预旋转） |
 | `preview.py` | 用假数据出图，改版式时看效果 |
 | `make_icon.py` | 生成掌机启动器图标 |
-| `deploy_device.py` | 把掌机端推送过去（`--miyoo` / `--rocknix`） |
+| `deploy_device.py` | 把掌机端推送过去（`--miyoo` / `--rocknix` / `--muos`） |
 | `paths.py` | 区分「exe 旁边的可写文件」和「打包进去的只读文件」 |
 | `build_exe.py` | 打包成单文件 `dist/PCMonitor.exe` |
 | `device/` | 掌机端，一个固件一套：Onion 用 `launch.sh` / `config.json` / `settings.cfg`；ROCKNIX 用 `launch_rocknix.sh` / `settings_rocknix.cfg`；muOS 用 `mux_launch.sh` / `launch_muos.sh` / `settings_muos.cfg` |
@@ -129,11 +148,15 @@ python -m pip install psutil pillow paramiko
 一台 PC Monitor，结果写进 `hosts.txt`（`IP|主机名`，主循环每轮重读）。32 路并发扫
 完 254 个地址约 5–9 秒。
 
+扫描是**循环进行**的，间隔由 `DISCOVER_EVERY_S`（默认 120 秒）控制：新开机的 PC
+会在下一次扫描后自己出现在设备条里，不用退出重开。只有列表真变了才会打断当前
+画面重连一次，平时扫描不干扰播放。
+
 之所以是 TCP 连接扫描而不是广播：掌机的 `nc` 没有 `-u`，`ping` 也没有 `-b`，UDP
 发现和广播探测都做不了。
 
 扫描没有任何结果时保留原有的 `hosts.txt`，不会把已知设备清空。当前设备连不上时会
-每 2 秒重试，并在上一轮扫描结束后重新扫一遍。
+每 2 秒重试，并让正在等的扫描立刻来一轮。
 
 ### 竖屏
 
@@ -175,8 +198,11 @@ ROCKNIX 上尺寸正好对得上：sway 用 `transform=270` 驱动 DSI-1，逻�
 - **刷新速率** 1–30 fps，带 5 档预设，实时估算带宽占用
 - **画质** JPEG 质量 40–95
 - **预旋转 180°** 开关（掌机画面上下颠倒时关掉它）
+- **天气位置**：经纬度 / 城市名 / 都留空自动定位（见「天气小组件」）
 - 一张信息卡显示掌机当前朝向（横向 / 竖向 / 倒置）
 - 页脚带一路实时预览（始终是正着的，跟着掌机的横竖切换）
+
+> AI 各家的 key 不在设置页，在 `config.json` 里手填（见「AI 额度」）。
 
 改动**立即生效并写入 `config.json`**，越界值会被拒绝（HTTP 400），配置不变。
 
@@ -197,13 +223,17 @@ PC 端 `config.json`（`port` 只能在这里改，改完要重启服务）：
 | `fps` | 8 | 帧率。约 33 KB/帧，8 fps ≈ 2.2 Mbps |
 | `jpeg_quality` | 72 | JPEG 质量 |
 | `rotate180` | true | 预旋转 180°，匹配 Miyoo 面板方向。ROCKNIX 掌机会自己抵消掉，所以这个开关只影响 Miyoo |
+| `weather_city` / `weather_lat` / `weather_lon` | 空 / 空 / 空 | 天气定位：见「天气小组件」，三选一 |
+| `deepseek_key` | 空 | DeepSeek 额度查询的 API key |
+| `minimax_key` / `minimax_region` | 空 / `cn` | MiniMax 额度查询的 API key 与地域 |
+| `aimon_port` | 9000 | Claude 额度走本地 aimon 服务的端口 |
 
 掌机端（Onion 在 `/mnt/SDCARD/App/PCMonitor/`，ROCKNIX 在
 `/storage/roms/ports/pcmonitor/`）：
 
 | 文件 | 作用 |
 |---|---|
-| `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率；`BATT_EVERY_S` / `BATT_LOW_PCT` / `BATT_BUZZ_GAP_S` 控制电量上报与震动；ROCKNIX 多一个 `PANEL_FLIP` |
+| `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率；`DISCOVER_EVERY_S` 控制局域网重新扫描的间隔；`BATT_EVERY_S` / `BATT_LOW_PCT` / `BATT_BUZZ_GAP_S` 控制电量上报与震动；ROCKNIX 多一个 `PANEL_FLIP` |
 | `hosts.txt` | 扫到的设备表，每行 `IP\|主机名`，自动维护 |
 | `state.cfg` | 上次选的 `IDX` 和 `ORIENT` |
 | `pcmonitor.log` | 本次运行的日志，每次启动清空 |
@@ -281,6 +311,36 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
 这种毫无意义的数字。所以只匹配 `GetForegroundWindow()` 对应的 PID；切出游戏时
 显示"无游戏 / 前台没有游戏画面"。
 
+## 天气小组件
+
+一个小方块显示当前城市、温度和天气图标，外加未来 3 小时 / 6 小时 / 第二天 /
+第三天的预报。数据来自 **Open-Meteo**，免费、不需要任何 key。
+
+定位三选一（设置页填写），优先级从高到低：
+
+1. **经纬度**（`weather_lat` / `weather_lon`）——直接按坐标查；
+2. **城市名**（`weather_city`）——中英文都行，走 Open-Meteo 自带的免费
+   geocoder 解析成坐标，按名字缓存；
+3. **都留空**——按公网 IP 定位一次，之后缓存一段时间。
+
+> 走代理 / VPN 时公网 IP 会定位到别的国家，所以只要填一下城市名即可，不用
+> 自己查经纬度。天气接口不可用时这一格显示错误原因，其余指标不受影响。
+
+## AI 额度
+
+`aiquota.py` 后台轮询三家 API 的额度，画成用量条：
+
+- **Claude**：5 小时 / 7 天用量条，带 Opus 开关和 `extra` 计费额度（走
+  `aimon` 本地服务，端口在 `config.json` 的 `aimon_port`）；
+- **DeepSeek**：账户余额；
+- **MiniMax**：按**模型组**分（"general" 文本、视频等），仪表盘取文本额度，
+  `/ai` 页面列全部并带各自的 5 小时 / 7 天用量和重置时间。
+
+浏览器开 `http://<PC>:8765/ai` 看完整明细；没配 key 的提供商直接显示为
+"未配置"，配了 key 一分钟后自动点亮，不用重启服务。各家 key 填在
+`config.json`：`deepseek_key` / `minimax_key`（Claude 走 `aimon`，填它的
+地址即可）。
+
 ## HTTP 接口
 
 | 路径 | 内容 |
@@ -292,6 +352,7 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
 | `/frame.jpg` | 当前单帧 |
 | `/config.json` | 当前生效的设置 + `name`（主机名）。掌机每次连接前读它取帧率，发现阶段也靠 `name` 判断"这是不是一台 PC Monitor" |
 | `/battery?pct=57&charging=0` | 掌机上报自己的电量。用 GET 是因为调用方是掌机上的 busybox curl，而且每分钟重复一次，越简单越好 |
+| `/ai` | AI 额度明细页（Claude / DeepSeek / MiniMax 全部字段） |
 | `/stats.json` | 原始快照，想自己做别的客户端就用这个 |
 
 ## 排查
