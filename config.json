@@ -4,9 +4,9 @@
   "jpeg_quality": 72,
   "rotate180": true,
   "aimon_port": 9000,
-  "weather_city": "\u6df1\u5733",
-  "weather_lat": 22.5431,
-  "weather_lon": 114.0579,
+  "weather_city": "",
+  "weather_lat": null,
+  "weather_lon": null,
   "deepseek_key": "",
   "minimax_key": "",
   "minimax_region": "cn"

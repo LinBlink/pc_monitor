@@ -482,10 +482,11 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
   <div class="card">
     <div class="row">
       <label for="city">天气位置</label>
-      <div class="hint">经纬度留空就按公网 IP 自动定位（免费的 Open-Meteo，
-        不需要任何 key）。定位到别的城市时在这里手填。</div>
+      <div class="hint">填城市名就按城市查（中英文都行）；再填经纬度则以经纬度为准；
+        全留空才按公网 IP 自动定位——走代理时 IP 会定位到别的国家，填一下城市即可。
+        用的是免费的 Open-Meteo，不需要任何 key。</div>
       <div class="ctl">
-        <input type="text" id="city" name="weather_city" placeholder="城市名（显示用）"
+        <input type="text" id="city" name="weather_city" placeholder="城市名，如 南京 / Nanjing"
                value="{html.escape(str(cfg.get("weather_city") or ""))}">
       </div>
       <div class="ctl" style="margin-top:10px">

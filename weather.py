@@ -16,10 +16,13 @@ from __future__ import annotations
 import json
 import threading
 import time
+import urllib.parse
 
 import webjson
 
 GEO_URL = "http://ip-api.com/json/?fields=status,city,lat,lon"
+GEOCODE_URL = ("https://geocoding-api.open-meteo.com/v1/search"
+               "?name={name}&count=1&language=zh&format=json")
 FORECAST_URL = (
     "https://api.open-meteo.com/v1/forecast"
     "?latitude={lat:.4f}&longitude={lon:.4f}"
@@ -60,27 +63,49 @@ class WeatherPoller(threading.Thread):
         self._stop = threading.Event()
         self._geo: tuple[float, float, str] | None = None
         self._geo_due = 0.0
+        self._cities: dict[str, tuple[float, float] | None] = {}
+        self._err = "定位中"
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
         due = 0.0
+        pinned = object()  # nothing can equal this, so the first pass polls
         while not self._stop.is_set():
+            cfg = self._cfg() or {}
+            # A location typed into the settings page should show up on the next
+            # frame, not at the end of a quarter-hour interval.
+            here = (cfg.get("weather_lat"), cfg.get("weather_lon"),
+                    (cfg.get("weather_city") or "").strip())
+            if here != pinned:
+                pinned, due = here, 0.0
             if time.monotonic() >= due:
-                ok = self._poll(self._cfg() or {})
+                ok = self._poll(cfg)
                 due = time.monotonic() + (EVERY_S if ok else RETRY_S)
             self._stop.wait(5.0)
 
     def _locate(self, cfg: dict):
-        """Configured coordinates win; otherwise geolocate the public IP once."""
+        """Coordinates, then a typed city name, then the public IP.
+
+        A city name has to actually decide the location rather than only label
+        it: typing one and still being shown another city's weather — which is
+        what happens when the IP resolves through a VPN — is worse than useless.
+        """
         lat, lon = cfg.get("weather_lat"), cfg.get("weather_lon")
         city = (cfg.get("weather_city") or "").strip()
         if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
             return float(lat), float(lon), city
 
+        if city:
+            found = self._geocode(city)
+            if found:
+                return found[0], found[1], city
+            self._err = f"找不到城市 {city}"
+            return None
+
         if self._geo and time.monotonic() < self._geo_due:
-            return self._geo[0], self._geo[1], city or self._geo[2]
+            return self._geo[0], self._geo[1], self._geo[2]
 
         status, payload = webjson.get_json(GEO_URL, timeout=5.0)
         if status == 200 and isinstance(payload, dict) and \
@@ -88,14 +113,39 @@ class WeatherPoller(threading.Thread):
             self._geo = (float(payload["lat"]), float(payload["lon"]),
                          payload.get("city") or "")
             self._geo_due = time.monotonic() + GEO_RETRY_S
-            return self._geo[0], self._geo[1], city or self._geo[2]
+            return self._geo
+        self._err = "定位中"
         return None
+
+    def _geocode(self, city: str):
+        """City name -> coordinates, via Open-Meteo's own free geocoder.
+
+        Cached by name: the answer cannot change, and this runs on every poll.
+        """
+        if city in self._cities:
+            return self._cities[city]
+        status, payload = webjson.get_json(
+            GEOCODE_URL.format(name=urllib.parse.quote(city)), timeout=8.0)
+        if status != 200 or not isinstance(payload, dict):
+            return None  # transient: do not cache, try again next poll
+        results = payload.get("results") or []
+        found = None
+        if results and isinstance(results[0], dict):
+            try:
+                found = (float(results[0]["latitude"]),
+                         float(results[0]["longitude"]))
+            except (KeyError, TypeError, ValueError):
+                found = None
+        self._cities[city] = found  # a name that does not resolve stays cached
+        return found
 
     def _poll(self, cfg: dict) -> bool:
         where = self._locate(cfg)
         if where is None:
-            if not self.data.get("ok"):
-                self.data = {"ok": False, "city": "", "err": "定位中"}
+            # A location we cannot resolve replaces stale readings from an old
+            # one: showing another city's weather under this city's name is the
+            # bug this whole path exists to avoid.
+            self.data = {"ok": False, "city": "", "err": self._err}
             return False
         lat, lon, city = where
 
