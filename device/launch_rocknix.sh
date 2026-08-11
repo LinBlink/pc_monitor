@@ -34,6 +34,7 @@ hosts="$progdir/hosts.txt"
 state="$progdir/state.cfg"
 cmdfile=/tmp/pcmon_cmd
 stopflag=/tmp/pcmon_stop
+sweepflag=/tmp/pcmon_sweep
 pidfile=/tmp/pcmon_player
 targetfile=/tmp/pcmon_target
 selfpid="$progdir/.pid"
@@ -67,6 +68,7 @@ JSBTN_RIGHT=16       # BTN_DPAD_RIGHT
 PC_HOST=192.168.2.114
 PC_PORT=8765
 STREAM_FPS=8
+DISCOVER_EVERY_S=120
 BATT_EVERY_S=60
 PANEL_FLIP=0
 [ -f "$progdir/settings.cfg" ] && . "$progdir/settings.cfg"
@@ -194,6 +196,27 @@ discover() {
     else
         say "discover: nothing found, keeping $(host_count) known"
     fi
+}
+
+# The original sweep ran once at launch, so a PC that started up afterwards
+# never appeared in the switcher — you had to quit and relaunch to see it. This
+# re-sweeps on a timer instead. It is cheap to do so: discover() compares the
+# result with the current list and only interrupts the stream when it actually
+# changed. The wait is in one-second steps so quitting stays instant, and a
+# touch of the sweep flag cuts it short when the current PC has gone quiet.
+discover_loop() {
+    while [ ! -f "$stopflag" ]; do
+        discover
+        i=0
+        while [ "$i" -lt "$DISCOVER_EVERY_S" ] && [ ! -f "$stopflag" ]; do
+            if [ -f "$sweepflag" ]; then
+                rm -f "$sweepflag"
+                break
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+    done
 }
 
 # --- battery ---------------------------------------------------------------
@@ -344,7 +367,7 @@ cleanup() {
     for p in "${KR_PID:-}" "${DISC_PID:-}" "${BATT_PID:-}" "${WD_PID:-}"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$targetfile"
+    rm -f "$targetfile" "$sweepflag"
 }
 trap 'cleanup; exit 0' INT TERM
 
@@ -366,7 +389,7 @@ echo "$$" > "$selfpid"
 # hand the flag straight to this instance's own helpers, which would exit
 # immediately and leave the app running with no buttons and no battery reports.
 : > "$cmdfile"
-rm -f "$stopflag"
+rm -f "$stopflag" "$sweepflag"
 
 # Seed the list with the configured host so the first frame does not wait for
 # a subnet sweep; discovery then refines it in the background.
@@ -374,7 +397,7 @@ rm -f "$stopflag"
 
 keyreader &
 KR_PID=$!
-discover &
+discover_loop &
 DISC_PID=$!
 battery_loop &
 BATT_PID=$!
@@ -407,10 +430,9 @@ while :; do
             rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state; continue ;;
             refresh) continue ;;
         esac
-        if ! kill -0 "$DISC_PID" 2>/dev/null; then
-            discover &
-            DISC_PID=$!
-        fi
+        # Nobody home: the list may be stale, so ask the discovery loop to
+        # sweep now rather than waiting out its interval.
+        touch "$sweepflag"
         continue
     fi
 
