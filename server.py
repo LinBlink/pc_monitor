@@ -20,6 +20,7 @@ Endpoints
     /frame.jpg     a single current frame
     /config.json   effective settings, read by the handheld at launch
     /stats.json    the raw snapshot, for building other clients
+    /battery       the handheld reports its own charge level here
 """
 
 from __future__ import annotations
@@ -133,11 +134,12 @@ class FrameSource(threading.Thread):
     the variants some client is actually watching get rendered, which keeps the
     cost at one or two renders per cycle no matter how many orientations exist.
 
-    A variant key is ``("panel", orient, chrome)`` for frames mapped onto the
-    handheld's panel, or ``("upright", portrait)`` for the browser, which wants
+    A variant key is ``("panel", orient, chrome, client)`` for frames mapped onto
+    the handheld's panel, or ``("upright", portrait)`` for the browser, which wants
     the layout the right way up. ``chrome`` is the handheld's own device list as
-    ``(names, index)`` — it is part of the key because two handhelds sitting on
-    different devices need different headers.
+    ``(names, index)`` and ``client`` its address: both are part of the key because
+    two handhelds need different headers — different device lists, and each one's
+    own battery level.
     """
 
     def __init__(self, settings: Settings):
@@ -155,6 +157,8 @@ class FrameSource(threading.Thread):
         self.last_orient = 0
         self.last_chrome: tuple | None = None
         self.last_frame_bytes = 0
+        # client address -> (percent, charging, monotonic time reported)
+        self._battery: dict[str, tuple[float, bool, float]] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -168,6 +172,32 @@ class FrameSource(threading.Thread):
     def wake_clients(self) -> None:
         with self._cv:
             self._cv.notify_all()
+
+    # A handheld that has gone away should not leave a stale charge level on
+    # screen, so a report expires rather than persisting until it is replaced.
+    BATTERY_TTL_S = 120.0
+
+    def report_battery(self, client: str, percent: float, charging: bool) -> None:
+        with self._cv:
+            self._battery[client] = (percent, charging, time.monotonic())
+
+    def battery(self, client: str) -> dict | None:
+        with self._cv:
+            entry = self._battery.get(client)
+        if not entry:
+            return None
+        percent, charging, at = entry
+        if time.monotonic() - at > self.BATTERY_TTL_S:
+            return None
+        return {"percent": percent, "charging": charging}
+
+    def batteries(self) -> dict[str, dict]:
+        """Every live report, for the settings page."""
+        with self._cv:
+            items = list(self._battery.items())
+        now = time.monotonic()
+        return {ip: {"percent": p, "charging": c}
+                for ip, (p, c, at) in items if now - at <= self.BATTERY_TTL_S}
 
     def preview_key(self) -> tuple:
         """Upright variant matching however the handheld is currently held."""
@@ -217,11 +247,12 @@ class FrameSource(threading.Thread):
             variants = {}
             for key in keys:
                 if key[0] == "panel":
-                    _, orient, chrome = key
+                    _, orient, chrome, client = key
                     names, dev_idx = chrome or ((), 0)
                     img = render.render(snap, self.fonts, orient=orient,
                                         panel_flip=flip, devices=names,
-                                        dev_idx=dev_idx)
+                                        dev_idx=dev_idx,
+                                        battery=self.battery(client))
                 else:
                     img = render.draw_layout(snap, self.fonts,
                                              portrait=bool(key[1]))
@@ -310,6 +341,15 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
     else:
         devs = "掌机还没连上来"
 
+    batts = source.batteries()
+    if batts:
+        batt = "、".join(
+            f"{html.escape(ip)} <b>{v['percent']:.0f}%</b>"
+            + ("（充电中 ⚡）" if v["charging"] else "")
+            for ip, v in sorted(batts.items()))
+    else:
+        batt = "掌机没有上报（旧版 launch.sh 不会上报电量）"
+
     banner = ""
     if message:
         banner += f'<p class="note">{html.escape(message)}</p>'
@@ -375,6 +415,7 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
   <table>
     <tr><td>掌机朝向</td><td>{orient_label}（掌机上按 <b>Y</b> 切换）</td></tr>
     <tr><td>掌机扫到的设备</td><td>{devs}</td></tr>
+    <tr><td>掌机电量</td><td>{batt}</td></tr>
     <tr><td>切换设备</td><td>掌机上按 <b>左 / 右</b>，退出按 <b>MENU</b></td></tr>
     <tr><td>实时预览</td><td><a href="/preview">/preview</a></td></tr>
     <tr><td>原始数据</td><td><a href="/stats.json">/stats.json</a> ·
@@ -426,8 +467,10 @@ class Handler(BaseHTTPRequestHandler):
     source: FrameSource  # injected below
     settings: Settings
 
+    QUIET_PATHS = ("/stats.json", "/config.json", "/battery")
+
     def log_message(self, fmt, *args):
-        if self.path not in ("/stats.json", "/config.json"):
+        if not self.path.startswith(self.QUIET_PATHS):
             print(f"[http] {self.client_address[0]} {self.command} {self.path}",
                   flush=True)
 
@@ -451,8 +494,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/preview":
             self._send("text/html; charset=utf-8", preview_page())
         elif path == "/stream.mjpg":
-            self._stream(("panel", self._orient(query), self._chrome(query)),
-                         multipart=False)
+            self._stream(("panel", self._orient(query), self._chrome(query),
+                          self.client_address[0]), multipart=False)
+        elif path == "/battery":
+            self._battery(query)
         elif path == "/preview.mjpg":
             self._stream(self.source.preview_key(), multipart=True)
         elif path == "/frame.jpg":
@@ -506,6 +551,27 @@ class Handler(BaseHTTPRequestHandler):
                          urllib.parse.quote(msg))
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _battery(self, query: dict) -> None:
+        """``/battery?pct=57&charging=0`` — the handheld's own charge level.
+
+        It is a GET because busybox's curl is what has to call it, and it repeats
+        every minute anyway, so nothing is lost by making it the simplest request
+        the handheld can send. The level is attributed to the caller's address
+        rather than anything in the query, so one handheld cannot overwrite
+        another's reading.
+        """
+        try:
+            pct = float(query.get("pct", [""])[0])
+        except (TypeError, ValueError):
+            self._send("text/plain", b"bad pct", 400)
+            return
+        if not 0 <= pct <= 100:
+            self._send("text/plain", b"pct out of range", 400)
+            return
+        charging = query.get("charging", ["0"])[0] not in ("0", "", "false")
+        self.source.report_battery(self.client_address[0], pct, charging)
+        self._send("text/plain", b"ok")
 
     @staticmethod
     def _orient(query: dict) -> int:
@@ -608,7 +674,18 @@ def main() -> int:
     Handler.source = source
     Handler.settings = settings
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # On Windows SO_REUSEADDR lets a second process bind a port that is already
+    # in use, and requests then land on whichever socket the OS picks — a second
+    # copy of this server would silently answer some of them. Refusing to reuse
+    # the address turns that into an error at startup instead.
+    ThreadingHTTPServer.allow_reuse_address = False
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as exc:
+        print(f"cannot listen on port {port}: {exc}\n"
+              f"Another PC Monitor is probably already running.", flush=True)
+        source.stop()
+        return 1
     httpd.daemon_threads = True
 
     cfg = settings.snapshot()

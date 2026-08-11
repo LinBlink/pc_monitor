@@ -8,6 +8,9 @@
 #            Y             rotate the display (4 steps, portrait included)
 #            MENU          quit
 #
+# The handheld's own battery level is reported to the PC so it can be drawn in the
+# header, and a low battery buzzes the motor.
+#
 # Buttons are read straight from /dev/input/event0. evdev delivers events to
 # every reader, so this works alongside ffplay's own SDL input. The device is
 # opened once and held on fd 3 for the whole session: re-opening it per read
@@ -27,6 +30,7 @@ state="$progdir/state.cfg"
 cmdfile=/tmp/pcmon_cmd
 stopflag=/tmp/pcmon_stop
 pidfile=/tmp/pcmon_player
+targetfile=/tmp/pcmon_target
 selfpid="$progdir/.pid"
 
 # evdev key codes on the Miyoo Mini.
@@ -38,6 +42,9 @@ KEY_Y=56
 PC_HOST=192.168.2.114
 PC_PORT=8765
 STREAM_FPS=8
+BATT_EVERY_S=60
+BATT_LOW_PCT=15
+BATT_BUZZ_GAP_S=600
 [ -f "$progdir/settings.cfg" ] && . "$progdir/settings.cfg"
 
 IDX=0
@@ -139,6 +146,74 @@ discover() {
 	fi
 }
 
+# --- battery ---------------------------------------------------------------
+# The dashboard is drawn on the PC, so the handheld's own charge level has to be
+# sent there: /battery?pct=..&charging=.. once a minute, attributed by the PC to
+# the address it came from.
+#
+# /customer/app/axp_test talks to the PMIC and prints
+#   {"battery":100, "voltage":4155, "charging":3}
+# It has to run from its own directory. charging=3 is "plugged in" on this
+# firmware. /tmp/percBat (kept fresh by Onion's batmon) is the fallback for the
+# percentage, but it says nothing about charging.
+battery_read() {
+	BATT_PCT=""
+	BATT_CHG=0
+	raw=$(cd /customer/app 2>/dev/null && ./axp_test 2>/dev/null)
+	if [ -n "$raw" ]; then
+		BATT_PCT=$(echo "$raw" | sed -n 's/.*"battery": *\([0-9]*\).*/\1/p')
+		chg=$(echo "$raw" | sed -n 's/.*"charging": *\([0-9]*\).*/\1/p')
+		[ "$chg" = "3" ] && BATT_CHG=1
+	fi
+	if [ -z "$BATT_PCT" ] && [ -f /tmp/percBat ]; then
+		BATT_PCT=$(cat /tmp/percBat 2>/dev/null)
+	fi
+	case "$BATT_PCT" in
+		'' | *[!0-9]*) BATT_PCT="" ;;
+	esac
+}
+
+# The motor hangs off gpio48, which rests high — the same pin Onion's keymon
+# pulses. Onion's own opt-out is honoured so this never overrides the user's
+# setting for the whole device.
+vibrate() {
+	[ -f "$sysdir/config/.noVibration" ] && return
+	[ -e /sys/class/gpio/gpio48/value ] || return
+	echo out > /sys/class/gpio/gpio48/direction 2>/dev/null
+	echo 0 > /sys/class/gpio/gpio48/value 2>/dev/null
+	usleep 200000 2>/dev/null || sleep 1
+	echo 1 > /sys/class/gpio/gpio48/value 2>/dev/null
+}
+
+battery_loop() {
+	LAST_BUZZ=0
+	while [ ! -f "$stopflag" ]; do
+		battery_read
+		target=$(cat "$targetfile" 2>/dev/null)
+		if [ -n "$BATT_PCT" ] && [ -n "$target" ]; then
+			"$BIN/curl" -s -m 3 -o /dev/null \
+				"$target/battery?pct=$BATT_PCT&charging=$BATT_CHG"
+		fi
+
+		if [ -n "$BATT_PCT" ] && [ "$BATT_LOW_PCT" -gt 0 ] &&
+			[ "$BATT_CHG" = "0" ] && [ "$BATT_PCT" -le "$BATT_LOW_PCT" ]; then
+			now=$(date +%s)
+			if [ $((now - LAST_BUZZ)) -ge "$BATT_BUZZ_GAP_S" ]; then
+				LAST_BUZZ=$now
+				say "battery $BATT_PCT% low, buzzing"
+				vibrate
+			fi
+		fi
+
+		# Sleep in one-second steps so quitting does not wait out the interval.
+		i=0
+		while [ $i -lt "$BATT_EVERY_S" ] && [ ! -f "$stopflag" ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+	done
+}
+
 # --- button reader ---------------------------------------------------------
 # Writes an action then kills ffplay, in that order, so the main loop always
 # finds the action already waiting when ffplay returns.
@@ -203,6 +278,8 @@ cleanup() {
 	[ -s "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null
 	[ -n "$KR_PID" ] && kill "$KR_PID" 2>/dev/null
 	[ -n "$DISC_PID" ] && kill "$DISC_PID" 2>/dev/null
+	[ -n "$BATT_PID" ] && kill "$BATT_PID" 2>/dev/null
+	rm -f "$targetfile"
 	echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 }
 trap 'cleanup; exit 0' INT TERM
@@ -231,6 +308,8 @@ keyreader &
 KR_PID=$!
 discover &
 DISC_PID=$!
+battery_loop &
+BATT_PID=$!
 
 say "start idx=$IDX orient=$ORIENT"
 
@@ -244,6 +323,8 @@ while :; do
 	host=$(echo "$line" | cut -d'|' -f1)
 	[ -z "$host" ] && host=$PC_HOST
 	base="http://$host:$PC_PORT"
+	# The battery reporter posts to whichever PC is currently on screen.
+	echo "$base" > "$targetfile"
 
 	conf=$("$BIN/curl" -s -m 4 "$base/config.json")
 	if [ -z "$conf" ]; then

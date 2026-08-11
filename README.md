@@ -2,7 +2,12 @@
 
 在 Windows PC 上跑一个小服务，把 CPU / 内存 / 网络 / GPU / 游戏 FPS 画成一张
 仪表盘，通过 WiFi 以 MJPEG 流推给 Miyoo Mini Plus（Onion OS）全屏显示。掌机会自己
-扫局域网找出所有能监控的 PC，左右键切换，Y 键转屏（支持竖屏）。
+扫局域网找出所有能监控的 PC，左右键切换，Y 键转屏（支持竖屏），自己的电量也会显示
+在顶栏、低电量时震动。
+
+一屏包含：CPU 总占用 / 温度 / 功耗 / 每个逻辑核心的占用与实时频率、游戏 FPS、
+GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用前三的进程、网络实时
+上下行与当日累计流量、内存。
 
 **为什么这么设计**：掌机是 ARMv7 双核、没有 python/lua/编译器，但自带 `ffplay`。
 所以让 PC 承担全部采集与绘图，掌机只解码一路 640×480 MJPEG——完全在 Cortex-A7
@@ -13,8 +18,9 @@
 | 文件 | 作用 |
 |---|---|
 | `server.py` | MJPEG 服务，帧生产线程 + HTTP 接口 |
-| `metrics.py` | 采集 CPU / 内存 / 网络 / GPU / 进程 |
+| `metrics.py` | 采集 CPU / 内存 / 网络 / GPU / 进程 / 当日流量 |
 | `rtss.py` | 从 RivaTuner 共享内存读游戏 FPS |
+| `sensors.py` | 从 MSI Afterburner 共享内存读 CPU 温度 / 功耗 / 每核频率 |
 | `render.py` | Pillow 绘制仪表盘（横/竖两套版式 + 旋转 + 180° 预旋转） |
 | `preview.py` | 用假数据出图，改版式时看效果 |
 | `make_icon.py` | 生成掌机启动器图标 |
@@ -138,7 +144,7 @@ PC 端 `config.json`（`port` 只能在这里改，改完要重启服务）：
 
 | 文件 | 作用 |
 |---|---|
-| `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率 |
+| `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率；`BATT_EVERY_S` / `BATT_LOW_PCT` / `BATT_BUZZ_GAP_S` 控制电量上报与震动 |
 | `hosts.txt` | 扫到的设备表，每行 `IP\|主机名`，自动维护 |
 | `state.cfg` | 上次选的 `IDX` 和 `ORIENT` |
 | `pcmonitor.log` | 本次运行的日志，每次启动清空 |
@@ -146,6 +152,60 @@ PC 端 `config.json`（`port` 只能在这里改，改完要重启服务）：
 
 PC 的 IP 变了不用管，扫描会重新找到它——只有换端口才需要同时改 `PC_PORT` 和 PC 的
 `config.json`。
+
+## CPU 温度、功耗、每核频率
+
+这三项来自 **MSI Afterburner** 的共享内存 `MAHMSharedMemory`（就是 RTSS 的同伴，
+装了 Afterburner 就有）。**Afterburner 没运行时温度和功耗显示"温度需 Afterburner"，
+每核心只画占用条不画频率**，其余指标不受影响。
+
+为什么绕这一圈：Windows 不把 CPU 温度暴露给普通程序——`psutil.sensors_temperatures()`
+在 Windows 上返回 None，WMI 的 thermal zone 顶多是主板传感器，要自己读就得装内核
+驱动。Afterburner 的硬件监控已经在读 CPU 自己的寄存器，把结果发布在共享内存里，所以
+直接读它就能拿到真值，不用自己上驱动。
+
+`sensors.py` 按名字取值（`CPU temperature` / `CPU power` / `CPU3 clock` …）而不是按
+下标，所以换机器、传感器数量变了也不会错位。Afterburner 读不到的传感器会填
+±FLT_MAX，这种值一律当作"没有"。
+
+顺带一提，**总频率也优先用 Afterburner 的**：Windows 上 `psutil.cpu_freq()` 报的是
+标称基频（这台机器是 1800 MHz），跟实际睿频到 4.3 GHz 差得远。
+
+## 进程排行
+
+- **CPU 前三**：`psutil` 全进程遍历，3 秒一次（遍历不便宜，所以不跟帧率同步）。
+  占用按整机归一化，跳过 pid 0 的 System Idle Process。
+- **GPU 前三**：读 `\GPU Engine(*)\Utilization Percentage` 性能计数器，也就是任务
+  管理器 GPU 那一列的来源。按 pid 把各引擎（3D / copy / video）加起来，再用 psutil
+  把 pid 换成进程名。用它而不是 `nvidia-smi pmon` 的原因是它跟显卡厂商无关，而且能
+  算上图形负载而不只是计算负载；用 `Get-Counter` 循环而不是 `typeperf` 通配符，是
+  因为后者只在启动时枚举一次实例，之后新起的进程永远不会出现。
+
+## 当日流量
+
+`net.day_down` / `net.day_up` 是本地零点以来的累计字节数，数值大了自动从 MB 换到
+GB、TB。
+
+操作系统并不提供"今天用了多少"这种计数，所以这里累加的是和实时速率同一份增量，并
+写进 `traffic.json`（每 30 秒一次，避免频繁写盘）——有这个文件，重启服务不会丢当天
+的数据。**只统计服务在运行的时间段**，服务没开的时候走的流量不算。跨过本地零点自动
+归零。
+
+## 掌机电量与震动
+
+掌机每 60 秒把自己的电量报给 PC：`/battery?pct=57&charging=0`，PC 按**请求来源地址**
+归属这条数据，所以多台掌机不会互相覆盖，超过 120 秒没有新上报就不再显示（避免关掉
+的掌机在画面上留一个过期电量）。顶栏画一个电池图形：>30% 用普通字色，≤30% 转黄，
+≤15% 转红，充电时转绿并加 ⚡。
+
+电量来自 `/customer/app/axp_test`，它输出 `{"battery":100, "voltage":4155,
+"charging":3}`（必须在它自己的目录里执行；`charging=3` 在这台固件上表示插着电）。
+读不到时退回 Onion 的 batmon 维护的 `/tmp/percBat`，那里只有百分比没有充电状态。
+
+**低电量震动**：不充电且电量 ≤ `BATT_LOW_PCT`（默认 15）时震一下，最短间隔
+`BATT_BUZZ_GAP_S`（默认 600 秒）。马达挂在 gpio48 上（平时为高，拉低即震），和
+Onion 的 keymon 用的是同一个引脚；**Onion 自己的 `.noVibration` 开关会被尊重**，
+所以在系统里关了震动，这里也不会震。`BATT_LOW_PCT=0` 可以单独关掉震动。
 
 ## 游戏 FPS
 
@@ -172,6 +232,7 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
 | `/preview` | 只有预览的页面 |
 | `/frame.jpg` | 当前单帧 |
 | `/config.json` | 当前生效的设置 + `name`（主机名）。掌机每次连接前读它取帧率，发现阶段也靠 `name` 判断"这是不是一台 PC Monitor" |
+| `/battery?pct=57&charging=0` | 掌机上报自己的电量。用 GET 是因为调用方是掌机上的 busybox curl，而且每分钟重复一次，越简单越好 |
 | `/stats.json` | 原始快照，想自己做别的客户端就用这个 |
 
 ## 排查
@@ -194,12 +255,19 @@ TrafficMonitor 都在列表里，直接取"最新条目"会显示成 `TrafficMon
 - **画面卡顿 / 延迟增长**：设置页把刷新速率降到 5 或 2，或把画质降到 60。
 
 - **GPU 显示"未检测到"**：`nvidia-smi` 不在 PATH 或不是 NVIDIA 卡。本项目的 GPU
-  数据只走 `nvidia-smi`。
+  数据只走 `nvidia-smi`（GPU 前三不受影响，它走性能计数器）。
+
+- **端口被占用**：服务启动时会直接报错退出，而不是悄悄和另一份共用端口。
+  Windows 上 `SO_REUSEADDR` 允许第二个进程绑同一个端口，请求会随机落到其中一个
+  socket 上——所以这里显式关掉了地址复用。看到这个报错就是已经有一份在跑了。
 
 ## 已知限制
 
-- **没有 CPU 温度**。Windows 上拿不到，需要 LibreHardwareMonitor 之类的内核驱动
-  取数，暂未接入。GPU 温度有（来自 `nvidia-smi`）。
+- **CPU 温度和功耗依赖 MSI Afterburner 在运行**。建议把 Afterburner 设成开机启动，
+  它和 RTSS 是一套。GPU 温度不依赖它（来自 `nvidia-smi`）。
+- **当日流量只统计服务运行期间**，见上面「当日流量」。
+- **每核心频率在 Afterburner 没运行时不显示**（只画占用条）。
+- GPU 前三的百分比是各引擎之和，可能和任务管理器某一列不完全一致。
 - 掌机端在等 PC 时是**黑屏**，不显示提示——Onion 的 `infoPanel` 会抢占
   framebuffer 且行为不稳，故未采用。日志里能看到状态。
 - 发现只扫**本机所在的 /24 网段**，跨网段的 PC 需要手动往 `hosts.txt` 里加一行

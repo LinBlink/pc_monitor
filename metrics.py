@@ -9,6 +9,9 @@ it.
 from __future__ import annotations
 
 import collections
+import datetime
+import json
+import os
 import platform
 import socket
 import subprocess
@@ -19,6 +22,7 @@ from dataclasses import dataclass, field
 import psutil
 
 import rtss
+import sensors
 
 HISTORY = 72  # samples kept per sparkline
 
@@ -114,6 +118,138 @@ class GpuPoller(threading.Thread):
                             temp_c=num(parts[4]), power_w=num(parts[5]), ok=True)
 
 
+class GpuProcPoller(threading.Thread):
+    """Top GPU consumers, from the same counters Task Manager uses.
+
+    ``\\GPU Engine(*)\\Utilization Percentage`` has one instance per process and
+    engine, named ``pid_1234_luid_..._engtype_3D``. Summing a process's engines
+    gives the figure people recognise from Task Manager's GPU column, and unlike
+    ``nvidia-smi pmon`` it is vendor-neutral and lists graphics work, not just
+    compute. Get-Counter re-enumerates instances every sample, so processes that
+    start later still appear — which ``typeperf`` with a wildcard would not do.
+    """
+
+    SCRIPT = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "while($true){"
+        " $s=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage').CounterSamples;"
+        " if($s){"
+        "  $s | Group-Object {($_.InstanceName -split '_')[1]} | ForEach-Object {"
+        "   $v=($_.Group | Measure-Object CookedValue -Sum).Sum;"
+        "   if($v -gt 0.05){ \"$($_.Name) $([math]::Round($v,2))\" } } }"
+        " '---'; [Console]::Out.Flush(); Start-Sleep -Seconds %d }"
+    )
+
+    def __init__(self, interval_s: float = 2.0, count: int = 3):
+        super().__init__(daemon=True)
+        self.interval_s = max(1, int(interval_s))
+        self.count = count
+        self.top: list[tuple[str, float]] = []
+        self.ok = False
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     self.SCRIPT % self.interval_s],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                batch: list[tuple[int, float]] = []
+                for line in proc.stdout:
+                    if self._stop.is_set():
+                        break
+                    line = line.strip()
+                    if line == "---":
+                        self._publish(batch)
+                        batch = []
+                        continue
+                    pid, _, value = line.partition(" ")
+                    try:
+                        batch.append((int(pid), float(value)))
+                    except ValueError:
+                        continue
+            except (OSError, ValueError):
+                self.ok = False
+            finally:
+                if proc and proc.poll() is None:
+                    proc.kill()
+            if not self._stop.wait(5.0):
+                continue
+
+    def _publish(self, batch: list[tuple[int, float]]) -> None:
+        rows = []
+        for pid, pct in sorted(batch, key=lambda r: r[1], reverse=True):
+            if len(rows) >= self.count:
+                break
+            try:
+                rows.append((psutil.Process(pid).name(), min(pct, 100.0)))
+            except (psutil.Error, ValueError):
+                continue  # exited between the counter read and now
+        self.top = rows
+        self.ok = True
+
+
+class DailyTraffic:
+    """Bytes moved since local midnight, kept across restarts.
+
+    The OS has no per-day total to ask for, so this accumulates the same deltas
+    the rate display is built from and persists them; the file is what makes a
+    server restart not lose the day. Only time the server was running is counted.
+    """
+
+    SAVE_EVERY_S = 30.0
+
+    def __init__(self, path: str):
+        self.path = path
+        self.down = 0.0
+        self.up = 0.0
+        self.day = self._today()
+        self._last_save = 0.0
+        self._load()
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.date.today().isoformat()
+
+    def _load(self) -> None:
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if data.get("day") == self.day:
+            self.down = float(data.get("down", 0.0))
+            self.up = float(data.get("up", 0.0))
+
+    def _save(self) -> None:
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"day": self.day, "down": round(self.down),
+                           "up": round(self.up)}, fh)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def add(self, down_bytes: float, up_bytes: float) -> None:
+        today = self._today()
+        if today != self.day:
+            self.day, self.down, self.up = today, 0.0, 0.0
+            self._last_save = 0.0
+        self.down += max(0.0, down_bytes)
+        self.up += max(0.0, up_bytes)
+        now = time.monotonic()
+        if now - self._last_save >= self.SAVE_EVERY_S:
+            self._last_save = now
+            self._save()
+
+
 class TopProcPoller(threading.Thread):
     """Top CPU consumers, refreshed slowly — a full process walk is not cheap."""
 
@@ -151,6 +287,10 @@ class TopProcPoller(threading.Thread):
             self.top = rows[: self.count]
 
 
+TRAFFIC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "traffic.json")
+
+
 class Collector:
     def __init__(self):
         self.host = socket.gethostname()
@@ -168,19 +308,29 @@ class Collector:
         self._last_net = self._nic_counters()
         self._last_net_t = time.monotonic()
 
+        self.traffic = DailyTraffic(TRAFFIC_PATH)
+
         psutil.cpu_percent(None)  # prime the delta
+        psutil.cpu_percent(None, percpu=True)  # percpu keeps its own last-values
 
         self.gpu = GpuPoller()
         self.gpu.start()
         self.procs = TopProcPoller()
         self.procs.start()
+        self.gpu_procs = GpuProcPoller()
+        self.gpu_procs.start()
 
         self._rtss_checked = 0.0
         self._rtss_up = False
+        # Afterburner is the only CPU temperature source here, and its shared
+        # memory has to be re-walked to notice it appearing or going away.
+        self._sensors_checked = 0.0
+        self._sensors: sensors.Sensors | None = None
 
     def close(self) -> None:
         self.gpu.stop()
         self.procs.stop()
+        self.gpu_procs.stop()
 
     @staticmethod
     def _cpu_name() -> str:
@@ -224,18 +374,31 @@ class Collector:
 
         cpu = psutil.cpu_percent(None)
         self.cpu_hist.push(cpu)
+        cores = psutil.cpu_percent(None, percpu=True) or []
+
+        # Afterburner reads the CPU's own registers, so prefer its clock over
+        # psutil's, which reports the nominal base frequency on Windows.
+        if now - self._sensors_checked > 2.0:
+            self._sensors = sensors.read()
+            self._sensors_checked = now
+        sens = self._sensors
 
         freq = psutil.cpu_freq()
         cpu_ghz = (freq.current / 1000.0) if freq and freq.current else 0.0
+        if sens and sens.cpu_clock_mhz:
+            cpu_ghz = sens.cpu_clock_mhz / 1000.0
 
         vm = psutil.virtual_memory()
         self.mem_hist.push(vm.percent)
 
         recv, sent = self._nic_counters()
         dt = max(1e-3, now - self._last_net_t)
-        down = max(0.0, (recv - self._last_net[0]) / dt)
-        up = max(0.0, (sent - self._last_net[1]) / dt)
+        d_bytes = max(0.0, recv - self._last_net[0])
+        u_bytes = max(0.0, sent - self._last_net[1])
+        down = d_bytes / dt
+        up = u_bytes / dt
         self._last_net, self._last_net_t = (recv, sent), now
+        self.traffic.add(d_bytes, u_bytes)
         self.down_hist.push(down)
         self.up_hist.push(up)
 
@@ -259,6 +422,12 @@ class Collector:
                 "cores": self.cpu_cores,
                 "hist": self.cpu_hist.list(),
                 "peak": self.cpu_hist.peak,
+                "core_pct": list(cores),
+                "core_mhz": list(sens.core_clocks_mhz) if sens else [],
+                "core_temps": list(sens.core_temps_c) if sens else [],
+                "temp_c": sens.cpu_temp_c if sens else None,
+                "power_w": sens.cpu_power_w if sens else None,
+                "sensors": sens is not None,
             },
             "mem": {
                 "percent": vm.percent,
@@ -274,6 +443,8 @@ class Collector:
                 "up_hist": self.up_hist.list(),
                 "down_peak": self.down_hist.peak,
                 "up_peak": self.up_hist.peak,
+                "day_down": self.traffic.down,
+                "day_up": self.traffic.up,
             },
             "gpu": {
                 "ok": gpu.ok,
@@ -293,6 +464,7 @@ class Collector:
                 "hist": self.fps_hist.list(),
             },
             "top": list(self.procs.top),
+            "gpu_top": list(self.gpu_procs.top),
         }
 
 
