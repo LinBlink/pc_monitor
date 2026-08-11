@@ -49,17 +49,46 @@ DEFAULTS = {
     "fps": 8,
     "jpeg_quality": 72,
     "rotate180": True,
+    # aimon's clients scan the LAN for port 9000, so answering there too is what
+    # lets this program replace aimon's own server without touching them. 0 off.
+    "aimon_port": 9000,
+    "weather_city": "",
+    "weather_lat": None,
+    "weather_lon": None,
+    "deepseek_key": "",
+    "minimax_key": "",
+    "minimax_region": "cn",
 }
 
-# Editable from the settings page: name -> (kind, low, high).
+# Editable from the settings page: name -> (kind, low, high). For "str" the high
+# is a length cap; for "num" an empty field means None, which is how the weather
+# widget is told to geolocate instead.
 EDITABLE = {
     "fps": ("int", 1, 30),
     "jpeg_quality": ("int", 40, 95),
     "rotate180": ("bool", 0, 1),
+    "aimon_port": ("int", 0, 65535),
+    "weather_city": ("str", 0, 24),
+    "weather_lat": ("num", -90, 90),
+    "weather_lon": ("num", -180, 180),
+    "deepseek_key": ("str", 0, 200),
+    "minimax_key": ("str", 0, 400),
+    "minimax_region": ("choice", 0, 0),
 }
+
+CHOICES = {"minimax_region": ("cn", "global")}
+
+# API keys are write-only in the form: the page never renders a stored key back,
+# so an empty field means "leave it alone" and a key can only be removed by
+# ticking its clear box. Echoing a masked value back instead would make the key
+# depend on the mask surviving a round trip through the browser's encoding —
+# and anything that mangled it would silently overwrite the real key.
+SECRET_KEYS = ("deepseek_key", "minimax_key")
 
 # Only this one changes stream timing, so only it forces clients to reconnect.
 RECONNECT_KEYS = {"fps"}
+
+_START = time.time()
 
 
 class Settings:
@@ -97,6 +126,24 @@ class Settings:
         kind, low, high = EDITABLE[key]
         if kind == "bool":
             return str(raw).lower() in ("1", "true", "on", "yes")
+        if kind == "str":
+            text = str(raw).strip()
+            if len(text) > high:
+                raise ValueError(f"{key} 太长（最多 {high} 个字符）")
+            return text
+        if kind == "choice":
+            text = str(raw).strip().lower()
+            if text not in CHOICES[key]:
+                raise ValueError(f"{key} must be one of {CHOICES[key]}")
+            return text
+        if kind == "num":
+            text = str(raw).strip()
+            if not text:
+                return None
+            number = float(text)
+            if not low <= number <= high:
+                raise ValueError(f"{key} must be between {low} and {high}")
+            return round(number, 5)
         value = int(float(raw))
         if not low <= value <= high:
             raise ValueError(f"{key} must be between {low} and {high}")
@@ -145,7 +192,7 @@ class FrameSource(threading.Thread):
     def __init__(self, settings: Settings):
         super().__init__(daemon=True)
         self.settings = settings
-        self.collector = metrics.Collector()
+        self.collector = metrics.Collector(settings)
         self.fonts = render.Fonts()
 
         self._cv = threading.Condition()
@@ -299,6 +346,11 @@ label{display:block;color:#fff;font-weight:600;margin-bottom:2px}
 .hint{color:#898781;font-size:13px;margin-bottom:12px}
 .ctl{display:flex;align-items:center;gap:14px}
 input[type=range]{flex:1;min-width:0;accent-color:#3987e5}
+input[type=text],input[type=password],select{flex:1;min-width:0;background:#242423;
+  color:#fff;border:1px solid #313130;border-radius:6px;padding:8px 10px;
+  font:inherit;font-size:14px}
+input::placeholder{color:#6b6a66}
+select{flex:0 0 auto}
 output{min-width:74px;text-align:right;color:#fff;font-weight:600;
   font-variant-numeric:tabular-nums}
 .presets{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
@@ -328,12 +380,25 @@ code{background:#242423;padding:1px 5px;border-radius:4px;font-size:12px}
 """
 
 
+def _clear_box(key: str, stored: bool) -> str:
+    if not stored:
+        return ""
+    return (f'<div class="check" style="margin-top:10px">'
+            f'<input type="checkbox" id="c_{key}" name="clear_{key}" value="1">'
+            f'<label for="c_{key}" style="font-weight:400;color:#898781">'
+            f'删除已保存的 key</label></div>')
+
+
 def settings_page(settings: Settings, source: FrameSource, message: str = "",
                   warn: str = "") -> bytes:
     cfg = settings.snapshot()
     fps = int(cfg["fps"])
     quality = int(cfg["jpeg_quality"])
     rotate = bool(cfg["rotate180"])
+    region = str(cfg.get("minimax_region") or "cn")
+    saved = "已保存一个 key，留空即保持不变。"
+    ds_state = saved if cfg.get("deepseek_key") else "留空就不查。"
+    mm_state = saved if cfg.get("minimax_key") else "留空就不查。"
     frame_kb = max(1, source.last_frame_bytes // 1024)
     orient_label = ("横向", "竖向 ⟳", "横向 ⤒倒置", "竖向 ⟲")[source.last_orient % 4]
 
@@ -413,6 +478,62 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
       <span class="hint" style="margin:0">保存后掌机会自动重连</span>
     </div>
   </div>
+
+  <div class="card">
+    <div class="row">
+      <label for="city">天气位置</label>
+      <div class="hint">经纬度留空就按公网 IP 自动定位（免费的 Open-Meteo，
+        不需要任何 key）。定位到别的城市时在这里手填。</div>
+      <div class="ctl">
+        <input type="text" id="city" name="weather_city" placeholder="城市名（显示用）"
+               value="{html.escape(str(cfg.get("weather_city") or ""))}">
+      </div>
+      <div class="ctl" style="margin-top:10px">
+        <input type="text" name="weather_lat" placeholder="纬度 例 22.5431"
+               value="{"" if cfg.get("weather_lat") is None else cfg["weather_lat"]}">
+        <input type="text" name="weather_lon" placeholder="经度 例 114.0579"
+               value="{"" if cfg.get("weather_lon") is None else cfg["weather_lon"]}">
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="ds">DeepSeek API key</label>
+      <div class="hint">{ds_state}只保存在本机 config.json 里，不会发给掌机。</div>
+      <div class="ctl">
+        <input type="password" id="ds" name="deepseek_key" placeholder="sk-…">
+      </div>
+      {_clear_box("deepseek_key", bool(cfg.get("deepseek_key")))}
+    </div>
+
+    <div class="row">
+      <label for="mm">MiniMax API key</label>
+      <div class="hint">{mm_state}海外账号请把区域切成「海外」。</div>
+      <div class="ctl">
+        <input type="password" id="mm" name="minimax_key" placeholder="eyJ…">
+        <select name="minimax_region">
+          <option value="cn" {"selected" if region == "cn" else ""}>国内</option>
+          <option value="global" {"selected" if region == "global" else ""}>海外</option>
+        </select>
+      </div>
+      {_clear_box("minimax_key", bool(cfg.get("minimax_key")))}
+    </div>
+
+    <div class="row">
+      <label for="ap">aimon 兼容端口</label>
+      <div class="hint">额外监听一个端口，提供 <code>/api/info</code> 和
+        <code>/api/usage</code>，好让原来的 aimon 掌机端和网页照常找到这台机器。
+        0 表示关闭。<b>改这一项要重启程序才生效。</b></div>
+      <div class="ctl">
+        <input type="text" id="ap" name="aimon_port" style="max-width:120px"
+               value="{int(cfg.get("aimon_port") or 0)}">
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="save" type="submit">保存</button>
+      <span class="hint" style="margin:0">额度与天气会在下一轮轮询时更新</span>
+    </div>
+  </div>
 </form>
 
 <div class="card">
@@ -422,8 +543,10 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
     <tr><td>掌机电量</td><td>{batt}</td></tr>
     <tr><td>切换设备</td><td>掌机上按 <b>左 / 右</b>，退出按 <b>MENU</b></td></tr>
     <tr><td>实时预览</td><td><a href="/preview">/preview</a></td></tr>
+    <tr><td>AI 额度</td><td><a href="/ai">/ai</a>（完整字段，不用再单独跑 aimon）</td></tr>
     <tr><td>原始数据</td><td><a href="/stats.json">/stats.json</a> ·
-      <a href="/config.json">/config.json</a></td></tr>
+      <a href="/config.json">/config.json</a> ·
+      <a href="/api/usage">/api/usage</a> · <a href="/api/info">/api/info</a></td></tr>
   </table>
 </div>
 
@@ -454,6 +577,196 @@ sync();
 </html>""".encode("utf-8")
 
 
+# --- aimon compatibility ---------------------------------------------------
+# aimon was a second program doing the same quota lookups from its own server on
+# port 9000. Its two endpoints are reproduced here so its handheld client and web
+# page keep working against this process and nothing else has to be started.
+# Unlike aimon these answer from the poller's cache rather than calling upstream
+# per request, which is also what keeps Anthropic from rate-limiting us.
+
+def api_info(source: FrameSource, port: int) -> dict:
+    import psutil
+
+    snap = source.snapshot or {}
+    mem = snap.get("mem") or {}
+    total = mem.get("total_gb")
+    return {
+        "service": "aimon",
+        "version": 1,
+        "name": socket.gethostname(),
+        "hostname": socket.gethostname(),
+        "system": "Windows",
+        "release": os.environ.get("OS", ""),
+        "machine": os.environ.get("PROCESSOR_ARCHITECTURE", ""),
+        "os": f"PC Monitor on {socket.gethostname()}",
+        "ips": lan_ips(),
+        "port": port,
+        "uptime": int(time.time() - _START),
+        "time": int(time.time() * 1000),
+        "cpuCount": psutil.cpu_count(logical=True),
+        "cpuPercent": (snap.get("cpu") or {}).get("percent"),
+        "memTotal": int(total * 1024 ** 3) if total else None,
+        "memFree": int((total - mem["used_gb"]) * 1024 ** 3) if total else None,
+    }
+
+
+def api_usage(source: FrameSource) -> dict:
+    poller = source.collector.ai
+    out = dict(poller.raw)
+    claude = (poller.data or {}).get("claude") or {}
+    if "claude" not in out and claude.get("err"):
+        out["claude"] = {"error": claude["err"]}
+    out["ts"] = int(time.time() * 1000)
+    return out
+
+
+AI_CSS = """
+.quota{margin-bottom:18px}
+.quota:last-child{margin-bottom:0}
+.qhead{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.qhead b{color:#fff;font-weight:600}
+.qhead span{color:#898781;font-size:13px;font-variant-numeric:tabular-nums}
+.bar{height:8px;border-radius:4px;background:#123;margin-top:7px;overflow:hidden}
+.bar i{display:block;height:100%;background:#0096a3;border-radius:4px}
+.bar.crit i{background:#d03b3b}
+.bar.warn i{background:#fab219}
+.big{font-size:26px;color:#fff;font-weight:600;font-variant-numeric:tabular-nums}
+.muted{color:#898781}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:16px}
+"""
+
+
+def _bar(pct: float | None) -> str:
+    if pct is None:
+        return '<div class="bar"><i style="width:0"></i></div>'
+    cls = " crit" if pct >= 100 else (" warn" if pct >= 85 else "")
+    return (f'<div class="bar{cls}"><i style="width:{min(100.0, pct):.1f}%">'
+            f'</i></div>')
+
+
+def _quota_row(name: str, window) -> str:
+    if not window or window.get("pct") is None:
+        return (f'<div class="quota"><div class="qhead"><b>{name}</b>'
+                f'<span class="muted">该套餐没有这一档</span></div>'
+                f'{_bar(None)}</div>')
+    resets = window.get("resets_at")
+    at = (f'<span data-reset="{resets:.0f}">…</span>' if resets else
+          '<span class="muted">—</span>')
+    return (f'<div class="quota"><div class="qhead"><b>{name}</b>'
+            f'<span>{window["pct"]:.0f}% · {at}</span></div>'
+            f'{_bar(window["pct"])}</div>')
+
+
+def ai_page(source: FrameSource) -> bytes:
+    """Everything the pollers know, in full — the tile only has room for gauges."""
+    ai = source.collector.ai.data or {}
+    claude = ai.get("claude") or {}
+    weather = source.collector.weather.data or {}
+
+    if claude.get("five_hour"):
+        extra = claude.get("extra") or {}
+        if extra.get("used") is None:
+            extra_line = '<span class="muted">—</span>'
+        else:
+            state = "已开启" if extra.get("enabled") else \
+                f"已关闭（{html.escape(extra.get('reason') or '未开启')}）"
+            extra_line = (f'<span class="big">{extra["used"]:.2f}</span> '
+                          f'{html.escape(extra.get("currency") or "")} · {state}')
+        claude_body = (
+            _quota_row("5 小时窗口", claude.get("five_hour")) +
+            _quota_row("7 天窗口", claude.get("seven_day")) +
+            _quota_row("7 天 Opus", claude.get("seven_day_opus")) +
+            f'<div class="quota"><div class="qhead"><b>额外用量</b></div>'
+            f'<div style="margin-top:6px">{extra_line}</div></div>')
+        plan = html.escape((claude.get("plan") or "").capitalize())
+        stale = "" if claude.get("ok") else \
+            '<p class="warn">最近一次刷新失败，下面是上一次的数据。</p>'
+    else:
+        claude_body = (f'<p class="hint">拿不到额度：'
+                       f'{html.escape(str(claude.get("err") or "读取中"))}<br>'
+                       f'需要本机登录过 Claude Code（读取 ~/.claude/'
+                       f'.credentials.json）。</p>')
+        plan, stale = "", ""
+
+    ds = ai.get("deepseek")
+    if not ds:
+        ds_body = '<p class="hint">没有配置 API key。</p>'
+    elif not ds.get("ok") and ds.get("balance") is None:
+        ds_body = f'<p class="hint">{html.escape(str(ds.get("err")))}</p>'
+    else:
+        ds_body = (f'<div class="big">{ds["balance"]:.2f} '
+                   f'{html.escape(ds.get("currency") or "")}</div>'
+                   f'<p class="hint" style="margin:6px 0 0">'
+                   f'{"可用" if ds.get("available") else "不可用"}</p>')
+
+    mm = ai.get("minimax")
+    if not mm:
+        mm_body = '<p class="hint">没有配置 API key。</p>'
+    elif not mm.get("ok") and mm.get("five_hour") is None:
+        mm_body = f'<p class="hint">{html.escape(str(mm.get("err")))}</p>'
+    else:
+        mm_body = (_quota_row("5 小时已用", None if mm.get("five_hour") is None
+                              else {"pct": mm["five_hour"]}) +
+                   _quota_row("本周已用", None if mm.get("weekly") is None
+                              else {"pct": mm["weekly"]}))
+
+    if weather.get("ok"):
+        def cell(title, block, key_a, key_b=None):
+            if not block:
+                return ""
+            if key_b:
+                value = f'{block[key_a]:.0f}° ~ {block[key_b]:.0f}°'
+            else:
+                value = f'{block[key_a]:.0f}°'
+            return (f'<div><div class="hint" style="margin:0">{title}</div>'
+                    f'<div><b style="color:#fff">{html.escape(block.get("text") or "")}'
+                    f'</b> {value}</div></div>')
+        w_body = ('<div class="grid">' +
+                  cell("现在", weather.get("now"), "temp") +
+                  cell("3 小时后", weather.get("h3"), "temp") +
+                  cell("6 小时后", weather.get("h6"), "temp") +
+                  cell("明天", weather.get("d1"), "tmin", "tmax") +
+                  cell("后天", weather.get("d2"), "tmin", "tmax") +
+                  '</div>')
+        w_title = f'天气 · {html.escape(weather.get("city") or "")}'
+    else:
+        w_body = f'<p class="hint">{html.escape(str(weather.get("err") or "—"))}</p>'
+        w_title = "天气"
+
+    return f"""<!doctype html><html lang="zh"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 额度</title><style>{PAGE_CSS}{AI_CSS}</style>
+<div class="wrap">
+<h1>AI 额度</h1>
+<p class="sub">由 PC Monitor 在后台轮询，页面每分钟自动刷新。
+  <a href="/settings">设置 →</a> · <a href="/api/usage">原始数据</a></p>
+{stale}
+<div class="card"><div class="hint" style="margin-bottom:14px">Claude {plan}</div>
+{claude_body}</div>
+<div class="card"><div class="hint" style="margin-bottom:14px">DeepSeek</div>
+{ds_body}</div>
+<div class="card"><div class="hint" style="margin-bottom:14px">MiniMax</div>
+{mm_body}</div>
+<div class="card"><div class="hint" style="margin-bottom:14px">{w_title}</div>
+{w_body}</div>
+</div>
+<script>
+function tick(){{
+  const now = Date.now() / 1000;
+  document.querySelectorAll('[data-reset]').forEach(el => {{
+    let s = +el.dataset.reset - now;
+    if (s <= 0) {{ el.textContent = '即将重置'; return; }}
+    const d = Math.floor(s / 86400); s -= d * 86400;
+    const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+    el.textContent = (d ? d + ' 天 ' : '') +
+      h + ':' + String(m).padStart(2, '0') + ' 后重置';
+  }});
+}}
+tick(); setInterval(tick, 1000); setTimeout(() => location.reload(), 60000);
+</script>
+</html>""".encode("utf-8")
+
+
 def preview_page() -> bytes:
     return f"""<!doctype html><html lang="zh"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -471,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
     source: FrameSource  # injected below
     settings: Settings
 
-    QUIET_PATHS = ("/stats.json", "/config.json", "/battery")
+    QUIET_PATHS = ("/stats.json", "/config.json", "/battery", "/api/")
 
     def log_message(self, fmt, *args):
         if not self.path.startswith(self.QUIET_PATHS):
@@ -483,8 +796,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        # aimon's web page fetches these from another origin, so the API stays
+        # open the way aimon's own server was. It is a LAN dashboard either way.
+        if self.path.startswith("/api/"):
+            self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _json(self, payload) -> None:
+        self._send("application/json; charset=utf-8",
+                   json.dumps(payload, ensure_ascii=False,
+                              default=str).encode("utf-8"))
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -497,6 +827,12 @@ class Handler(BaseHTTPRequestHandler):
                        settings_page(self.settings, self.source, message=msg))
         elif path == "/preview":
             self._send("text/html; charset=utf-8", preview_page())
+        elif path == "/ai":
+            self._send("text/html; charset=utf-8", ai_page(self.source))
+        elif path == "/api/info":
+            self._json(api_info(self.source, self.server.server_port))
+        elif path == "/api/usage":
+            self._json(api_usage(self.source))
         elif path == "/stream.mjpg":
             self._stream(("panel", self._orient(query), self._chrome(query),
                           self.client_address[0]), multipart=False)
@@ -533,6 +869,13 @@ class Handler(BaseHTTPRequestHandler):
         # An unchecked checkbox is simply absent from the POST body.
         if "rotate180" not in changes:
             changes["rotate180"] = "0"
+        # A blank key field means "keep what is stored"; clearing one is an
+        # explicit tick, so an ordinary save can never wipe a key by omission.
+        for key in SECRET_KEYS:
+            if f"clear_{key}" in form:
+                changes[key] = ""
+            elif not changes.get(key, "").strip():
+                changes.pop(key, None)
 
         try:
             changed = self.settings.update(changes)
@@ -743,6 +1086,19 @@ def main() -> int:
         return 1
     httpd.daemon_threads = True
 
+    # The same handler on a second port: aimon's clients look for 9000 and know
+    # nothing about this program's own port, and serving them costs one thread.
+    aimon_port = int(settings.get("aimon_port") or 0)
+    aimon_httpd = None
+    if aimon_port and aimon_port != port:
+        try:
+            aimon_httpd = ThreadingHTTPServer(("0.0.0.0", aimon_port), Handler)
+            aimon_httpd.daemon_threads = True
+            threading.Thread(target=aimon_httpd.serve_forever,
+                             daemon=True).start()
+        except OSError as exc:
+            print(f"[warn] aimon 兼容端口 {aimon_port} 没能监听：{exc}", flush=True)
+
     cfg = settings.snapshot()
     # flush explicitly: redirected stdout is block-buffered, and this banner is
     # the only place the handheld's URL is shown.
@@ -752,6 +1108,9 @@ def main() -> int:
     for ip in lan_ips():
         print(f"  settings     : http://{ip}:{port}/settings")
         print(f"  handheld URL : http://{ip}:{port}/stream.mjpg")
+        print(f"  AI quota     : http://{ip}:{port}/ai")
+    if aimon_httpd:
+        print(f"  aimon compat : port {aimon_port} (/api/info, /api/usage)")
     print(f"  config       : {CONFIG_PATH}")
     if paths.frozen() and not os.path.exists(startup_shortcut()):
         print("  tip          : --install-autostart 可开机自启")
@@ -763,6 +1122,8 @@ def main() -> int:
         print("\nstopping...")
     finally:
         httpd.shutdown()
+        if aimon_httpd:
+            aimon_httpd.shutdown()
         source.stop()
     return 0
 

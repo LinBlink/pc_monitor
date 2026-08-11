@@ -2,6 +2,7 @@
 
 import math
 import sys
+import time
 
 import render
 
@@ -44,6 +45,31 @@ def snapshot(with_fps: bool) -> dict:
         "top": [("chrome.exe", 14.2), ("Code.exe", 6.1), ("python.exe", 3.4)],
         "gpu_top": [("Cyberpunk2077.exe", 92.0), ("chrome.exe", 4.3),
                     ("dwm.exe", 1.2)],
+        # Deliberately awkward: a maxed-out window, a plan without Opus, extra
+        # usage switched off and MiniMax unconfigured — the states most likely
+        # to break the layout all at once.
+        "ai": {
+            "claude": {
+                "ok": True, "err": None, "plan": "pro",
+                "five_hour": {"pct": 100.0, "resets_at": time.time() + 4 * 3600 + 720},
+                "seven_day": {"pct": 33.0, "resets_at": time.time() + 3 * 86400},
+                "seven_day_opus": None,
+                "extra": {"enabled": False, "pct": None, "used": 60.13,
+                          "currency": "USD", "reason": "out_of_credits"},
+            },
+            "deepseek": {"ok": True, "err": None, "available": True,
+                         "balance": 42.7, "currency": "CNY"},
+            "minimax": None,
+            "at": time.time(),
+        },
+        "weather": {
+            "ok": True, "err": None, "city": "深圳", "at": time.time(),
+            "now": {"code": 0, "text": "晴", "temp": 28.4},
+            "h3": {"code": 2, "text": "少云", "temp": 29.1},
+            "h6": {"code": 61, "text": "雨", "temp": 26.0},
+            "d1": {"code": 3, "text": "阴", "tmin": 24.0, "tmax": 31.0},
+            "d2": {"code": 95, "text": "雷雨", "tmin": 23.0, "tmax": 30.0},
+        },
     }
 
 

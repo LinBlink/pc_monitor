@@ -21,10 +21,12 @@ from dataclasses import dataclass, field
 
 import psutil
 
+import aiquota
 import paths
 import perfcounters
 import rtss
 import sensors
+import weather
 
 HISTORY = 72  # samples kept per sparkline
 
@@ -280,7 +282,14 @@ TRAFFIC_PATH = os.path.join(paths.base_dir(), "traffic.json")
 
 
 class Collector:
-    def __init__(self):
+    """Samples everything the renderer needs.
+
+    ``settings`` is the live config, read by the two web pollers for their API
+    keys and weather location; it is optional so the module self-test and
+    ``--save`` can build a collector without one.
+    """
+
+    def __init__(self, settings=None):
         self.host = socket.gethostname()
         self.cpu_name = self._cpu_name()
         self.cpu_cores = psutil.cpu_count(logical=True) or 1
@@ -306,6 +315,14 @@ class Collector:
         self.procs = ProcPoller()
         self.procs.start()
 
+        # Both talk to the internet, so like the GPU and process pollers they
+        # own a thread and the frame loop only ever reads their last result.
+        cfg = settings.snapshot if settings else (lambda: {})
+        self.ai = aiquota.AiPoller(cfg)
+        self.ai.start()
+        self.weather = weather.WeatherPoller(cfg)
+        self.weather.start()
+
         self._rtss_checked = 0.0
         self._rtss_up = False
         # Afterburner is the only CPU temperature source here, and its shared
@@ -316,6 +333,8 @@ class Collector:
     def close(self) -> None:
         self.gpu.stop()
         self.procs.stop()
+        self.ai.stop()
+        self.weather.stop()
 
     @staticmethod
     def _cpu_name() -> str:
@@ -450,6 +469,8 @@ class Collector:
             },
             "top": list(self.procs.cpu_top),
             "gpu_top": list(self.procs.gpu_top),
+            "ai": self.ai.data,
+            "weather": self.weather.data,
         }
 
 

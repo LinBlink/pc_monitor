@@ -18,6 +18,7 @@ text in ink tokens so identity always comes from a mark beside the text.
 from __future__ import annotations
 
 import math
+import time
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -40,6 +41,7 @@ C_MEM = (25, 158, 112)
 C_DOWN = (201, 133, 0)
 C_UP = (213, 81, 129)
 C_FPS = (144, 133, 233)
+C_AI = (0, 150, 163)
 
 # --- reserved status hues (never used as a series) ---
 S_GOOD = (12, 163, 12)
@@ -214,7 +216,9 @@ def _core_grid(img, d, f, box, pcts, mhz) -> None:
     cols = int(math.ceil(n / rows))
     cw = (x1 - x0) / cols
     ch = (y1 - y0) / rows
-    show_mhz = bool(mhz) and cw >= 30 and ch >= 26
+    # A cell fits its clock in 24px: an 11px label, a 9px bar and the gap. Below
+    # that the clocks go rather than shrink, since the bars are what you read.
+    show_mhz = bool(mhz) and cw >= 30 and ch >= 24
     bar_h = 9 if ch >= 22 else max(4, int(ch) - 4)
 
     for i, pct in enumerate(pcts):
@@ -241,22 +245,22 @@ def _cpu_tile(img, d, f, s, box) -> None:
     tile(d, box, f, "CPU", meta)
 
     y = y0 + TITLE_H
-    d.text((ix0, y), f"{c['percent']:.0f}%", font=f.value, fill=INK)
-    vw = d.textlength(f"{c['percent']:.0f}%", font=f.value)
+    d.text((ix0, y), f"{c['percent']:.0f}%", font=f.value_sm, fill=INK)
+    vw = d.textlength(f"{c['percent']:.0f}%", font=f.value_sm)
 
     # Temperature and package power sit beside the headline number: they are CPU
     # state, not a series of their own, so they take status ink and no hue.
     tx = ix0 + vw + 12
     if temp is not None:
-        dot(d, tx, y + 12, _temp_color(temp), 4)
-        d.text((tx + 13, y + 6), f"{temp:.0f}°C", font=f.value_xs, fill=INK2)
+        dot(d, tx, y + 9, _temp_color(temp), 4)
+        d.text((tx + 13, y + 3), f"{temp:.0f}°C", font=f.value_xs, fill=INK2)
         tx += 13 + d.textlength(f"{temp:.0f}°C", font=f.value_xs) + 12
     if power is not None:
-        d.text((tx, y + 6), f"{power:.0f} W", font=f.value_xs, fill=INK2)
+        d.text((tx, y + 3), f"{power:.0f} W", font=f.value_xs, fill=INK2)
     elif temp is None:
-        d.text((tx, y + 10), "温度需 Afterburner", font=f.tiny, fill=MUTED)
+        d.text((tx, y + 7), "温度需 Afterburner", font=f.tiny, fill=MUTED)
 
-    grid_top = y + 40
+    grid_top = y + 34
     if y1 - grid_top >= 22:
         _core_grid(img, d, f, (ix0, grid_top, ix1, y1 - 8),
                    c.get("core_pct") or [], c.get("core_mhz") or [])
@@ -291,7 +295,9 @@ def _fps_tile(img, d, f, s, box) -> None:
     dot(d, ix1 - sw - 13, y0 + 11, state_color, 4)
     d.text((ix1, y0 + 8), state, font=f.meta, fill=INK2, anchor="ra")
 
-    roomy = (y1 - y0) >= 88
+    # The big hero only earns its extra 12px when there is still room for the
+    # trend line underneath it; otherwise the smaller one keeps both on screen.
+    roomy = (y1 - y0) >= 96
     hero = f.hero if roomy else f.hero_sm
     y = y0 + TITLE_H - 4
 
@@ -364,6 +370,189 @@ def _mem_slim(img, d, f, s, box) -> None:
     bx1 = x1 - PADI - 34
     if bx1 - bx0 > 30:
         meter(d, (bx0, cy - 4, bx1, cy + 4), m["percent"] / 100.0, C_MEM)
+
+
+# --- AI quota -------------------------------------------------------------
+
+def _until(ts: float | None) -> str:
+    """How long until a quota window resets, at the precision that reads well."""
+    if not ts:
+        return ""
+    rem = ts - time.time()
+    if rem <= 0:
+        return "即将"
+    if rem >= 86400:
+        return f"{rem / 86400:.0f}天后"
+    return f"{int(rem // 3600)}:{int(rem % 3600 // 60):02d}后"
+
+
+def _money(amount: float, currency: str) -> str:
+    sym = {"USD": "$", "CNY": "¥", "RMB": "¥"}.get((currency or "").upper(), "")
+    return f"{sym}{amount:.0f}" if abs(amount) >= 100 else f"{sym}{amount:.2f}"
+
+
+def _quota_cell(label: str, window) -> tuple:
+    """A percentage gauge, or a placeholder when the plan has no such window."""
+    if not window or window.get("pct") is None:
+        return (label, "—", None, MUTED)
+    pct = window["pct"]
+    # The bar keeps AI's own hue; only the number turns, the way the FPS hero
+    # does, so a mark's colour never depends on its value.
+    ink = S_CRIT if pct >= 100 else (S_WARN if pct >= 85 else INK)
+    return (label, f"{pct:.0f}%", pct / 100.0, ink)
+
+
+def _ai_cells(ai: dict) -> list[tuple]:
+    """Seven gauges in a fixed order — position is how they are found at a glance.
+
+    Providers that are not configured keep their slot and show a dash rather
+    than collapsing the row, so the layout never moves under the eye.
+    """
+    claude = ai.get("claude") or {}
+    cells = [_quota_cell("C 5h", claude.get("five_hour")),
+             _quota_cell("C 7d", claude.get("seven_day")),
+             _quota_cell("Opus", claude.get("seven_day_opus"))]
+
+    extra = claude.get("extra") or {}
+    used = extra.get("used")
+    if used is None:
+        cells.append(("额外", "—", None, MUTED))
+    else:
+        # Extra usage is dollars, not a share of anything, so the bar is a state:
+        # full when credits can still be spent, empty when they cannot.
+        on = bool(extra.get("enabled"))
+        cells.append(("额外", _money(used, extra.get("currency")),
+                      1.0 if on else None, INK if on else INK2))
+
+    ds = ai.get("deepseek") or {}
+    if not ds.get("ok") or ds.get("balance") is None:
+        cells.append(("DS", "—", None, MUTED))
+    else:
+        on = bool(ds.get("available"))
+        cells.append(("DS", _money(ds["balance"], ds.get("currency")),
+                      1.0 if on else None, INK if on else S_CRIT))
+
+    mm = ai.get("minimax") or {}
+    for key, label in (("five_hour", "M 5h"), ("weekly", "M 周")):
+        value = mm.get(key) if mm.get("ok") else None
+        cells.append(_quota_cell(label, None if value is None else {"pct": value}))
+    return cells
+
+
+def _ai_note(ai: dict) -> str:
+    claude = ai.get("claude")
+    if not claude:
+        return "读取中…"
+    if not claude.get("five_hour"):
+        err = claude.get("err")
+        return {"no-creds": "未登录 Claude Code",
+                "no-token": "凭据里没有令牌",
+                "rate-limited": "接口限流，稍后重试",
+                "offline": "连不上 Anthropic"}.get(err, f"Claude 出错：{err}")
+
+    parts = [f"Claude {(claude.get('plan') or '').capitalize()}".strip()]
+    for key, name in (("five_hour", "5小时"), ("seven_day", "7天")):
+        window = claude.get(key)
+        if window and window.get("resets_at"):
+            parts.append(f"{name} {_until(window['resets_at'])}重置")
+    if not claude.get("ok"):
+        parts.append("数据可能过期")
+    return " · ".join(parts)
+
+
+def _ai_tile(img, d, f, s, box) -> None:
+    """Every quota this machine can see, as a row of small gauges.
+
+    Two shapes from one renderer: given enough height the tile takes a title and
+    stacks the gauges two deep; in the landscape strip it drops the title bar,
+    puts all seven on one line and spends the freed row on the reset countdowns,
+    which is the part a title could never carry.
+    """
+    x0, y0, x1, y1 = box
+    ix0, ix1 = x0 + PADI, x1 - PADI
+    ai = s.get("ai") or {}
+    cells = _ai_cells(ai)
+    note = _ai_note(ai)
+    roomy = (y1 - y0) >= 56
+
+    if roomy:
+        tile(d, box, f, "AI 额度", ellipsize(d, note, f.meta, (x1 - x0) * 0.68))
+        top, bottom, rows = y0 + TITLE_H, y1 - 6, 2
+    else:
+        d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+        top, bottom, rows = y0 + 4, y1 - 16, 1
+
+    cols = int(math.ceil(len(cells) / rows))
+    cw = (ix1 - ix0) / cols
+    row_h = (bottom - top) / rows
+
+    for i, (label, value, frac, ink) in enumerate(cells):
+        r, c = divmod(i, cols)
+        cx = ix0 + c * cw
+        cy = top + r * row_h
+        cell_w = cw - 10
+        vw = d.textlength(value, font=f.row)
+        d.text((cx, cy + 1), ellipsize(d, label, f.tiny, cell_w - vw - 5),
+               font=f.tiny, fill=MUTED)
+        d.text((cx + cell_w, cy), value, font=f.row, fill=ink, anchor="ra")
+        # Bottom-anchored so the bar survives the shortest row either layout
+        # asks for; below that there is no room for it at all.
+        by = cy + row_h - 6
+        if row_h >= 20:
+            if frac is None:
+                d.rounded_rectangle((cx, by, cx + cell_w, by + 6), radius=3,
+                                    fill=blend(C_AI, SURFACE, 0.16))
+            else:
+                meter(d, (cx, by, cx + cell_w, by + 6), frac, C_AI)
+
+    if not roomy:
+        d.text((ix0, y1 - 15), ellipsize(d, "AI 额度 · " + note, f.tiny,
+                                         ix1 - ix0), font=f.tiny, fill=MUTED)
+
+
+# --- weather --------------------------------------------------------------
+
+def _weather_slim(img, d, f, s, box) -> None:
+    """Now, +3h, +6h and the next two days on one 24px line.
+
+    No icons: there is no colour emoji face we can rely on being installed, and
+    a two-character word is both narrower and unambiguous at this size.
+    """
+    x0, y0, x1, y1 = box
+    w = s.get("weather") or {}
+    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    cy = (y0 + y1) // 2
+
+    if not w.get("ok"):
+        d.text((x0 + PADI, cy), f"天气 {w.get('err') or '—'}", font=f.meta,
+               fill=MUTED, anchor="lm")
+        return
+
+    def temp(v) -> str:
+        return "—" if v is None else f"{v:.0f}°"
+
+    now = w.get("now") or {}
+    segments = [(f"{now.get('text') or ''} {temp(now.get('temp'))}", INK)]
+    for key, name in (("h3", "3h"), ("h6", "6h")):
+        block = w.get(key)
+        if block:
+            segments.append((f"{name} {temp(block.get('temp'))}", INK2))
+    for key, name in (("d1", "明"), ("d2", "后")):
+        block = w.get(key)
+        if block:
+            segments.append((f"{name} {temp(block.get('tmin'))[:-1]}~"
+                             f"{temp(block.get('tmax'))}", INK2))
+
+    # Draw what fits and stop: the tail of this line is the least urgent part of
+    # the whole dashboard, so it yields rather than pushing anything else out.
+    cx = x0 + PADI
+    limit = x1 - PADI
+    for text, ink in segments:
+        width = d.textlength(text, font=f.tiny)
+        if cx + width > limit:
+            break
+        d.text((cx, cy), text, font=f.tiny, fill=ink, anchor="lm")
+        cx += width + 9
 
 
 # --- process tables -------------------------------------------------------
@@ -549,15 +738,17 @@ def _draw_landscape(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
     mx = x0 + half + GAP
     _header(d, f, s, w, devices, dev_idx, battery)
 
-    _cpu_tile(img, d, f, s, (x0, 28, x1, 152))
-    _fps_tile(img, d, f, s, (x0, 158, x0 + half, 256))
-    _gpu_tile(img, d, f, s, (mx, 158, x1, 256))
-    _proc_tile(img, d, f, (x0, 262, x0 + half, 350), "CPU 占用前三",
+    _cpu_tile(img, d, f, s, (x0, 28, x1, 140))
+    _fps_tile(img, d, f, s, (x0, 146, x0 + half, 236))
+    _gpu_tile(img, d, f, s, (mx, 146, x1, 236))
+    _proc_tile(img, d, f, (x0, 242, x0 + half, 318), "CPU 占用前三",
                s.get("top", []), C_CPU, "暂无")
-    _proc_tile(img, d, f, (mx, 262, x1, 350), "GPU 占用前三",
+    _proc_tile(img, d, f, (mx, 242, x1, 318), "GPU 占用前三",
                s.get("gpu_top", []), C_GPU, "暂无")
-    _net_tile(img, d, f, s, (x0, 356, x1, 442))
-    _mem_slim(img, d, f, s, (x0, 448, x1, 472))
+    _net_tile(img, d, f, s, (x0, 324, x1, 392))
+    _ai_tile(img, d, f, s, (x0, 398, x1, 442))
+    _mem_slim(img, d, f, s, (x0, 448, x0 + half, 472))
+    _weather_slim(img, d, f, s, (mx, 448, x1, 472))
 
 
 def _draw_portrait(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
@@ -567,17 +758,22 @@ def _draw_portrait(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
     mx = x0 + half + GAP
     _header(d, f, s, w, devices, dev_idx, battery)
 
-    _cpu_tile(img, d, f, s, (x0, 28, x1, 168))
+    _cpu_tile(img, d, f, s, (x0, 28, x1, 140))
     # Portrait is too narrow for the FPS trend line, so this tile is only as tall
     # as its headline needs; the height goes to GPU, which can show its VRAM.
-    _fps_tile(img, d, f, s, (x0, 174, x1, 246))
-    _gpu_tile(img, d, f, s, (x0, 252, x1, 352))
-    _proc_tile(img, d, f, (x0, 358, x0 + half, 446), "CPU 前三",
+    _fps_tile(img, d, f, s, (x0, 146, x1, 218))
+    _gpu_tile(img, d, f, s, (x0, 224, x1, 324))
+    _proc_tile(img, d, f, (x0, 330, x0 + half, 416), "CPU 前三",
                s.get("top", []), C_CPU, "暂无")
-    _proc_tile(img, d, f, (mx, 358, x1, 446), "GPU 前三",
+    _proc_tile(img, d, f, (mx, 330, x1, 416), "GPU 前三",
                s.get("gpu_top", []), C_GPU, "暂无")
-    _net_tile(img, d, f, s, (x0, 452, x1, 604))
-    _mem_slim(img, d, f, s, (x0, 610, x1, 634))
+    _net_tile(img, d, f, s, (x0, 422, x1, 496))
+    # Portrait has the height landscape does not, so the quota tile takes a
+    # title and two rows of gauges here, and weather gets a whole row rather
+    # than half of one — which is what lets it show all five readings.
+    _ai_tile(img, d, f, s, (x0, 502, x1, 572))
+    _mem_slim(img, d, f, s, (x0, 578, x1, 602))
+    _weather_slim(img, d, f, s, (x0, 608, x1, 632))
 
 
 # orient counts quarter-turns clockwise as the user rotates the handheld, so the
