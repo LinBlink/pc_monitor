@@ -1,0 +1,6 @@
+{
+	"label":	"PC Monitor",
+	"icon":	"/mnt/SDCARD/App/PCMonitor/icon.png",
+	"launch":	"launch.sh",
+	"description":	"Live PC stats over WiFi"
+}

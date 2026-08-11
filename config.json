@@ -1,0 +1,6 @@
+{
+  "port": 8765,
+  "fps": 8,
+  "jpeg_quality": 72,
+  "rotate180": true
+}
