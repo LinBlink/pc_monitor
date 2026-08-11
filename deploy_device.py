@@ -1,10 +1,11 @@
 """Push the handheld half of PC Monitor to a handheld over SSH.
 
-Two targets, because two firmwares put things in different places and want
+Three targets, because three firmwares put things in different places and want
 different files:
 
     --miyoo    Onion OS   -> /mnt/SDCARD/App/PCMonitor   (default)
     --rocknix  ROCKNIX    -> /storage/roms/ports
+    --muos     muOS       -> /mnt/mmc/MUOS/application/PC Monitor
 
 Shell scripts must land with LF endings and the exec bit set, which is why this
 uploads through SFTP with explicit newline handling instead of a plain copy.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import posixpath
+import shlex
 import sys
 import xml.etree.ElementTree as ET
 
@@ -57,6 +59,26 @@ ROCKNIX = {
     # settings sitting one level up.
     "stale": ["settings.cfg", "hosts.txt", "state.cfg", "pcmonitor.log", ".pid"],
     "open_with": 'EmulationStation 的 Ports 菜单里选 "PC Monitor"。SELECT 退出。',
+}
+
+# muOS wants one directory per application, with mux_launch.sh as the entry
+# point; everything else in the directory is the app's own business, so state
+# and settings just live next to the launcher.
+MUOS = {
+    "host": os.environ.get("MUOS_HOST", "192.168.2.105"),
+    "user": os.environ.get("MUOS_USER", "root"),
+    "password": os.environ.get("MUOS_PASS", "root"),
+    "dir": "/mnt/mmc/MUOS/application/PC Monitor",
+    "files": [("mux_launch.sh", "mux_launch.sh", 0o755),
+              ("launch_muos.sh", "pcmonitor.sh", 0o755),
+              ("settings_muos.cfg", "settings.cfg", 0o644)],
+    # No icon: muOS takes application icons from the active theme
+    # (image/grid/muxapp/<name>.png), not from the app's own directory, so a
+    # file dropped here would do nothing. The entry falls back to the theme's
+    # default glyph.
+    "assets": [],
+    "settings": "settings.cfg",
+    "open_with": 'muOS 的 Applications 菜单里选 "PC Monitor"。SELECT 退出。',
 }
 
 
@@ -127,12 +149,13 @@ def update_gamelist(sftp, path: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--rocknix", action="store_true", help="deploy to ROCKNIX")
+    ap.add_argument("--muos", action="store_true", help="deploy to muOS")
     ap.add_argument("--miyoo", action="store_true", help="deploy to Onion (default)")
     ap.add_argument("--keep-settings", action="store_true",
                     help="leave the handheld's own settings.cfg alone")
     args = ap.parse_args()
 
-    target = ROCKNIX if args.rocknix else MIYOO
+    target = ROCKNIX if args.rocknix else MUOS if args.muos else MIYOO
     print(f"Deploying to {target['user']}@{target['host']}:{target['dir']}")
 
     client = connect(target)
@@ -176,7 +199,7 @@ def main() -> int:
 
     sftp.close()
 
-    _, out, _ = client.exec_command(f"ls -l {target['dir']}")
+    _, out, _ = client.exec_command(f"ls -l {shlex.quote(target['dir'])}")
     print(out.read().decode("utf-8", "replace"))
     client.close()
     print(f"Deployed to {target['host']}:{target['dir']}")

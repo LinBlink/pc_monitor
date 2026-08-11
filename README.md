@@ -10,6 +10,7 @@
 |---|---|---|---|
 | Miyoo Mini Plus | Onion OS | ffplay | `/mnt/SDCARD/App/PCMonitor` |
 | Powkiddy X55 等 RK3566 机器 | ROCKNIX | mpv | `/storage/roms/ports` |
+| Anbernic RG35XX Pro 等 | muOS | ffmpeg → `/dev/fb0` | `/mnt/mmc/MUOS/application/PC Monitor` |
 
 一屏包含：CPU 总占用 / 温度 / 功耗 / 每个逻辑核心的占用与实时频率、游戏 FPS、
 GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用前三的进程、网络实时
@@ -33,7 +34,7 @@ GPU 占用 / 温度 / 功耗 / 显存、CPU 占用前三的进程、GPU 占用�
 | `deploy_device.py` | 把掌机端推送过去（`--miyoo` / `--rocknix`） |
 | `paths.py` | 区分「exe 旁边的可写文件」和「打包进去的只读文件」 |
 | `build_exe.py` | 打包成单文件 `dist/PCMonitor.exe` |
-| `device/` | 掌机端：Onion 用 `launch.sh` / `config.json` / `settings.cfg`，ROCKNIX 用 `launch_rocknix.sh` / `settings_rocknix.cfg` |
+| `device/` | 掌机端，一个固件一套：Onion 用 `launch.sh` / `config.json` / `settings.cfg`；ROCKNIX 用 `launch_rocknix.sh` / `settings_rocknix.cfg`；muOS 用 `mux_launch.sh` / `launch_muos.sh` / `settings_muos.cfg` |
 
 ## 用 exe 跑（推荐，换机器不用装环境）
 
@@ -85,14 +86,16 @@ python -m pip install psutil pillow paramiko
    ```
    python deploy_device.py                    # Miyoo / Onion，覆盖全部文件
    python deploy_device.py --rocknix          # ROCKNIX
-   python deploy_device.py --rocknix --keep-settings   # 保留掌机上已改的 settings.cfg
+   python deploy_device.py --muos             # muOS
+   python deploy_device.py --muos --keep-settings   # 保留掌机上已改的 settings.cfg
    ```
 
    地址和口令走环境变量：`MIYOO_HOST` / `MIYOO_USER` / `MIYOO_PASS`，
-   `ROCKNIX_HOST` / `ROCKNIX_USER` / `ROCKNIX_PASS`（默认
-   `192.168.2.81` / `root` / `rocknix`）。
+   `ROCKNIX_HOST` / …（默认 `192.168.2.81` / `root` / `rocknix`），
+   `MUOS_HOST` / …（默认 `192.168.2.105` / `root` / `root`）。
 
-4. **掌机上打开**：Onion 在 `Apps` 菜单，ROCKNIX 在 `Ports` 菜单，都叫 **PC Monitor**。
+4. **掌机上打开**：Onion 在 `Apps` 菜单，ROCKNIX 在 `Ports` 菜单，muOS 在
+   `Applications` 菜单，都叫 **PC Monitor**。
 
 > ⚠️ **重新部署前先在掌机上退出本应用。** busybox 的 sh 会边跑边读脚本文件，
 > 覆盖正在运行的 `launch.sh` 会让它执行错乱并留下一堆僵尸进程。
@@ -346,6 +349,34 @@ coreutils 而不是 busybox applet**，所以从 Onion 抄过来的写法要逐�
   Wayland（编译时关了 EGL），没有合成器就直接退出。脚本会自己在
   `$XDG_RUNTIME_DIR` 里找 `wayland-*` socket（这台是 `wayland-1`，不是常见的
   `wayland-0`），日志开头的 `display=` 就是它找到的那个。
+
+### muOS 专有
+
+muOS 卡在另外两个固件中间，哪一边的写法都不能照抄：shell 是 busybox ash（像
+Onion），但 busybox 是 1.36、**已经删掉了 `timeout -t`**（像 ROCKNIX）；面板是
+640×480（像 Onion），但**不倒装**（像 ROCKNIX）。
+
+- **播放器是 ffmpeg，不是 ffplay**。这机器没有 `/dev/dri`，SDL2 只编进了 `mali`
+  一个 video driver，与其赌 ffplay 能找到窗口系统，不如让 ffmpeg 用 `fbdev`
+  muxer 直接写 `/dev/fb0`。帧是 640×480、面板也是 640×480，一个像素都不用缩放。
+  像素格式是 BGRA（`fbset -i` 里的 `rgba 8/16,8/8,8/0,8/24`），对应 `-pix_fmt bgra`。
+- **按键索引是量出来的，不是推出来的**。joydev 按 keycode 升序编号，这一半能从
+  驱动位图推；但**哪个物理键对应哪个 keycode 是板子的接线**，rg35xx-pro 没按惯例
+  接。位图推出来 Y=4、SELECT=10，实测是 **Y=2、SELECT=6**。换板子就照日志里的
+  `btn N (unbound)` 重新量。
+- **方向键是 HAT 轴不是按钮**（`ABS_HAT0X`，js 轴 4，负=左正=右），ROCKNIX 那台
+  是四个独立按钮。所以读键循环两种事件都要处理。
+- **日志被 `Terminated` 刷屏**：busybox ash 每回收一个被信号杀掉的子进程都要报
+  一行，而读键循环每 2 秒就有一个 `dd` 被 `timeout` 杀掉。读键子进程里
+  `exec 2>/dev/null` 关掉即可——它本来也不往 stderr 写别的。
+- **低电量震动在这台上是有的**：马达是 `/sys/class/power_supply/axp2202-battery/moto`，
+  写 1 开、写 0 关（和 muOS 自己的 `RUMBLE()` 一样）。`BATT_LOW_PCT=0` 关掉。
+- 应用入口必须叫 `mux_launch.sh`，muOS 用文件开头的 `# HELP:` / `# GRID:` 注释在
+  菜单里显示。真正的脚本另起名叫 `pcmonitor.sh` 再 `exec` 过去，是因为 muOS 退出
+  时走 `pidof "$foreground_process"`，而内核把脚本的 comm 设成它自己的文件名——
+  都叫 `mux_launch.sh` 的话每个应用都会互相认领。
+- 图标取自主题包的 `image/grid/muxapp/`，不是应用目录，所以这里没放图标文件，
+  菜单里显示主题的默认图形。
 - **每次扫描都闪一下**：ROCKNIX 既没有 `cmp` 也没有 `diff`，命令不存在返回非零，
   被当成"设备列表变了"于是重连。改成在 shell 里比字符串。
 - **退出**：ROCKNIX 没给 ports 配组合键强杀，所以 **SELECT 是唯一的出口**。
@@ -366,6 +397,7 @@ coreutils 而不是 busybox applet**，所以从 Onion 抄过来的写法要逐�
   切流本身要 1–2 秒，这里就按"最后一次按键生效"处理，没有做按键队列。
 - **ROCKNIX 上没有低电量震动**。手柄本身有力反馈（`/proc/bus/input/devices` 里
   能看到 `FF=`），但触发一次效果要下 ioctl，shell 脚本做不到；电量照常显示在顶栏。
+  Onion 和 muOS 上有——那两台的马达是一个 sysfs 文件，写一下就震。
 - **ROCKNIX 上切设备/转屏比 Miyoo 慢一点**（约 1–2 秒）。mpv 每次启动要现编
   Vulkan 管线，日志里是 `Spent … ms translating SPIR-V`。这个固件的 mpv 关掉了
   EGL，所以换不成更轻的 OpenGL 后端。
