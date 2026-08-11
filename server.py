@@ -13,14 +13,17 @@ Endpoints
     /              the settings page
     /settings      GET the page, POST a form to apply
     /stream.mjpg   raw concatenated JPEGs — what ffplay on the handheld reads.
-                   ?orient=0..3 picks the layout, ?devs=a,b&i=0 draws the
-                   handheld's own device switcher in the header
+                   ?orient=0..3 picks the layout, ?page=0..1 the page, and
+                   ?devs=a,b&i=0 draws the handheld's own device switcher
     /preview.mjpg  multipart/x-mixed-replace — what a browser <img> reads
     /preview       live preview of the dashboard
     /frame.jpg     a single current frame
     /config.json   effective settings, read by the handheld at launch
     /stats.json    the raw snapshot, for building other clients
     /battery       the handheld reports its own charge level here
+    /advice.json   the latest AI read on how the machine is running, and
+                   whether the handheld should read it out loud
+    /advice.audio  that advice as speech, when there is any
 """
 
 from __future__ import annotations
@@ -41,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import metrics
 import paths
 import render
+import tts
 
 CONFIG_PATH = os.path.join(paths.base_dir(), "config.json")
 
@@ -58,6 +62,20 @@ DEFAULTS = {
     "deepseek_key": "",
     "minimax_key": "",
     "minimax_region": "cn",
+    # Nothing can read the wall socket, so the energy estimate needs to be told
+    # what the sensors cannot see: the rest of the machine, the supply's losses,
+    # and a TDP to fall back on when Afterburner is not running.
+    "power_base_w": 45,
+    "power_psu_pct": 90,
+    "cpu_tdp_w": 65,
+    "power_price": None,
+    # Off by default: it spends someone's API quota, and a monitor that starts
+    # talking to you unasked is not a good first impression.
+    "advice_enabled": False,
+    "advice_every_min": 30,
+    "speak_enabled": False,
+    # Which volume the disk tile watches. Almost always the system drive.
+    "disk_letter": "C",
 }
 
 # Editable from the settings page: name -> (kind, low, high). For "str" the high
@@ -74,7 +92,19 @@ EDITABLE = {
     "deepseek_key": ("str", 0, 200),
     "minimax_key": ("str", 0, 400),
     "minimax_region": ("choice", 0, 0),
+    "power_base_w": ("int", 0, 400),
+    "power_psu_pct": ("int", 50, 100),
+    "cpu_tdp_w": ("int", 0, 400),
+    "power_price": ("num", 0, 100),
+    "advice_enabled": ("bool", 0, 1),
+    "advice_every_min": ("int", 5, 720),
+    "speak_enabled": ("bool", 0, 1),
+    "disk_letter": ("str", 0, 1),
 }
+
+# Checkboxes are absent from a POST body when unticked, so they have to be
+# listed rather than inferred from what arrived.
+CHECKBOXES = ("rotate180", "advice_enabled", "speak_enabled")
 
 CHOICES = {"minimax_region": ("cn", "global")}
 
@@ -181,12 +211,13 @@ class FrameSource(threading.Thread):
     the variants some client is actually watching get rendered, which keeps the
     cost at one or two renders per cycle no matter how many orientations exist.
 
-    A variant key is ``("panel", orient, chrome, client)`` for frames mapped onto
-    the handheld's panel, or ``("upright", portrait)`` for the browser, which wants
-    the layout the right way up. ``chrome`` is the handheld's own device list as
-    ``(names, index)`` and ``client`` its address: both are part of the key because
-    two handhelds need different headers — different device lists, and each one's
-    own battery level.
+    A variant key is ``("panel", orient, page, chrome, client)`` for frames mapped
+    onto the handheld's panel, or ``("upright", portrait, page)`` for the browser,
+    which wants the layout the right way up. ``chrome`` is the handheld's own
+    device list as ``(names, index)`` and ``client`` its address: both are part of
+    the key because two handhelds need different headers — different device lists,
+    and each one's own battery level. ``page`` is there for the same reason: two
+    handhelds can be looking at different pages of the same machine.
     """
 
     def __init__(self, settings: Settings):
@@ -202,6 +233,7 @@ class FrameSource(threading.Thread):
         self._wanted: collections.Counter = collections.Counter()
         self._stop = threading.Event()
         self.last_orient = 0
+        self.last_page = 0
         self.last_chrome: tuple | None = None
         self.last_frame_bytes = 0
         # client address -> (percent, charging, monotonic time reported)
@@ -246,16 +278,22 @@ class FrameSource(threading.Thread):
         return {ip: {"percent": p, "charging": c}
                 for ip, (p, c, at) in items if now - at <= self.BATTERY_TTL_S}
 
-    def preview_key(self) -> tuple:
-        """Upright variant matching however the handheld is currently held."""
-        return ("upright", 1 if self.last_orient in (1, 3) else 0)
+    def preview_key(self, page: int | None = None) -> tuple:
+        """Upright variant matching however the handheld is currently held.
+
+        The page follows the handheld too unless the browser asked for one, so
+        opening /preview shows what is actually on the device right now.
+        """
+        return ("upright", 1 if self.last_orient in (1, 3) else 0,
+                self.last_page if page is None else page % render.PAGE_COUNT)
 
     def acquire(self, key: tuple) -> None:
         with self._cv:
             self._wanted[key] += 1
             if key[0] == "panel":
                 self.last_orient = key[1]
-                self.last_chrome = key[2]
+                self.last_page = key[2]
+                self.last_chrome = key[3]
 
     def release(self, key: tuple) -> None:
         with self._cv:
@@ -269,6 +307,26 @@ class FrameSource(threading.Thread):
             if self._seq == last_seq:
                 self._cv.wait(timeout)
             return self._variants.get(key), self._seq
+
+    def one_frame(self, key: tuple, timeout: float = 4.0):
+        """A single frame of any variant, rendering it if nobody is watching it.
+
+        Only wanted variants get drawn, so a one-shot request for a page or
+        orientation no client is streaming would otherwise wait for a frame that
+        is never produced. Registering interest for the duration of the request
+        is what makes the next cycle include it.
+        """
+        self.acquire(key)
+        try:
+            deadline = time.monotonic() + timeout
+            seq = -1
+            while time.monotonic() < deadline:
+                frame, seq = self.wait_frame(key, seq, timeout=1.0)
+                if frame is not None:
+                    return frame
+            return None
+        finally:
+            self.release(key)
 
     def _encode(self, img, quality: int) -> bytes:
         buf = io.BytesIO()
@@ -294,15 +352,15 @@ class FrameSource(threading.Thread):
             variants = {}
             for key in keys:
                 if key[0] == "panel":
-                    _, orient, chrome, client = key
+                    _, orient, page, chrome, client = key
                     names, dev_idx = chrome or ((), 0)
                     img = render.render(snap, self.fonts, orient=orient,
                                         panel_flip=flip, devices=names,
                                         dev_idx=dev_idx,
-                                        battery=self.battery(client))
+                                        battery=self.battery(client), page=page)
                 else:
                     img = render.draw_layout(snap, self.fonts,
-                                             portrait=bool(key[1]))
+                                             portrait=bool(key[1]), page=key[2])
                 variants[key] = self._encode(img, quality)
 
             panel = [v for k, v in variants.items() if k[0] == "panel"]
@@ -401,6 +459,7 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
     mm_state = saved if cfg.get("minimax_key") else "留空就不查。"
     frame_kb = max(1, source.last_frame_bytes // 1024)
     orient_label = ("横向", "竖向 ⟳", "横向 ⤒倒置", "竖向 ⟲")[source.last_orient % 4]
+    page_label = PAGE_NAMES[source.last_page % len(PAGE_NAMES)]
 
     if source.last_chrome:
         names, idx = source.last_chrome
@@ -418,6 +477,29 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
             for ip, v in sorted(batts.items()))
     else:
         batt = "掌机没有上报（旧版 launch.sh 不会上报电量）"
+
+    # The two "will this actually work" answers, computed rather than promised:
+    # what the advisor last did, and whether anything on this machine can read
+    # the language it writes in.
+    adv = source.collector.advisor.data
+    if not cfg.get("advice_enabled"):
+        advice_state = ""
+    elif adv.get("ok"):
+        advice_state = (f'<br>上次由 <b>{html.escape(adv.get("provider") or "")}</b> '
+                        f'给出，结论：{html.escape(adv.get("text") or "")}')
+    else:
+        advice_state = f'<br>当前状态：{html.escape(adv.get("err") or "还没跑过")}'
+
+    audio_err = (source.collector.audio or {}).get("err")
+    if audio_err:
+        voice_state = f'<br><span class="warn">上次合成失败：{html.escape(audio_err)}</span>'
+    elif (cfg.get("minimax_key") or "").strip():
+        voice_state = "<br>会用 MiniMax 的语音接口合成中文（消耗一点额度）。"
+    elif any(c.lower().startswith("zh") for c in tts.sapi_cultures()):
+        voice_state = "<br>会用 Windows 自带的中文语音合成，不联网。"
+    else:
+        voice_state = ('<br><span class="warn">这台机器上既没有 MiniMax key，'
+                       'Windows 也没装中文语音包，现在合成不出中文语音。</span>')
 
     banner = ""
     if message:
@@ -535,16 +617,95 @@ def settings_page(settings: Settings, source: FrameSource, message: str = "",
       <span class="hint" style="margin:0">额度与天气会在下一轮轮询时更新</span>
     </div>
   </div>
+
+  <div class="card">
+    <div class="row">
+      <label>耗电量估算</label>
+      <div class="hint">没有任何软件能读到插座上的实际功率，所以这是估算：
+        CPU 封装功耗（来自 Afterburner）加显卡功耗（来自 nvidia-smi），
+        再加下面这个「其余部分」，最后除以电源效率。累计值只统计本程序运行的时间。</div>
+      <div class="ctl">
+        <input type="text" name="power_base_w" style="max-width:110px"
+               value="{int(cfg.get("power_base_w") or 0)}">
+        <span class="hint" style="margin:0">W 主板/内存/硬盘/风扇等其余部分</span>
+      </div>
+      <div class="ctl" style="margin-top:10px">
+        <input type="text" name="power_psu_pct" style="max-width:110px"
+               value="{int(cfg.get("power_psu_pct") or 90)}">
+        <span class="hint" style="margin:0">% 电源效率（80Plus 金牌约 90）</span>
+      </div>
+      <div class="ctl" style="margin-top:10px">
+        <input type="text" name="cpu_tdp_w" style="max-width:110px"
+               value="{int(cfg.get("cpu_tdp_w") or 0)}">
+        <span class="hint" style="margin:0">W CPU TDP，只在读不到功耗传感器时用来推算</span>
+      </div>
+      <div class="ctl" style="margin-top:10px">
+        <input type="text" name="power_price" style="max-width:110px"
+               placeholder="留空不显示"
+               value="{"" if cfg.get("power_price") is None else cfg["power_price"]}">
+        <span class="hint" style="margin:0">元/度，填了才显示电费</span>
+      </div>
+      <div class="ctl" style="margin-top:10px">
+        <input type="text" name="disk_letter" style="max-width:110px"
+               value="{html.escape(str(cfg.get("disk_letter") or "C"))}">
+        <span class="hint" style="margin:0">磁盘监控的盘符，改完要重启程序</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="save" type="submit">保存</button>
+      <span class="hint" style="margin:0">改动立即生效，不影响已累计的数据</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="check">
+        <input type="checkbox" id="adv" name="advice_enabled" value="1"
+               {"checked" if cfg.get("advice_enabled") else ""}>
+        <label for="adv">AI 运行状况建议</label>
+      </div>
+      <div class="hint" style="margin:8px 0 0">每隔一段时间把这段时间的运行统计
+        （占用、温度、进程、流量、容器）发给一家 AI，让它判断有没有值得注意的地方；
+        一切正常时它只回「正常」，不会硬凑建议。用的是<b>余量最多</b>的那家——
+        目前在 DeepSeek 和 MiniMax 里选。Claude 不参与：这里能读到的是 Claude Code
+        的订阅令牌，不是 API key，不该拿来跑后台任务。{advice_state}</div>
+      <div class="ctl" style="margin-top:12px">
+        <input type="text" name="advice_every_min" style="max-width:110px"
+               value="{int(cfg.get("advice_every_min") or 30)}">
+        <span class="hint" style="margin:0">分钟一次（最少 5）</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="check">
+        <input type="checkbox" id="spk" name="speak_enabled" value="1"
+               {"checked" if cfg.get("speak_enabled") else ""}>
+        <label for="spk">语音播报</label>
+      </div>
+      <div class="hint" style="margin:8px 0 0">只有发现异常时才播；一切正常不出声。
+        语音在这台 PC 上合成，掌机拉过去播放，而且只有正在看这台机器的掌机会播。
+        {voice_state}</div>
+    </div>
+
+    <div class="actions">
+      <button class="save" type="submit">保存</button>
+      <span class="hint" style="margin:0">打开后会在一分钟内做第一次分析</span>
+    </div>
+  </div>
 </form>
 
 <div class="card">
   <table>
     <tr><td>掌机朝向</td><td>{orient_label}（掌机上按 <b>Y</b> 切换）</td></tr>
+    <tr><td>当前页</td><td>{page_label}（掌机上按 <b>上 / 下</b> 翻页）</td></tr>
     <tr><td>掌机扫到的设备</td><td>{devs}</td></tr>
     <tr><td>掌机电量</td><td>{batt}</td></tr>
     <tr><td>切换设备</td><td>掌机上按 <b>左 / 右</b>，退出按 <b>MENU</b></td></tr>
     <tr><td>实时预览</td><td><a href="/preview">/preview</a></td></tr>
     <tr><td>AI 额度</td><td><a href="/ai">/ai</a>（完整字段，不用再单独跑 aimon）</td></tr>
+    <tr><td>AI 建议</td><td><a href="/advice.json">/advice.json</a> ·
+      <a href="/advice.audio">/advice.audio</a>（掌机就是拉这两个）</td></tr>
     <tr><td>原始数据</td><td><a href="/stats.json">/stats.json</a> ·
       <a href="/config.json">/config.json</a> ·
       <a href="/api/usage">/api/usage</a> · <a href="/api/info">/api/info</a></td></tr>
@@ -776,14 +937,60 @@ tick(); setInterval(tick, 1000); setTimeout(() => location.reload(), 60000);
 </html>""".encode("utf-8")
 
 
-def preview_page() -> bytes:
+AUDIO_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav"}
+
+
+def advice_json(source: FrameSource, cfg: dict) -> dict:
+    """What the handheld polls: the latest advice and whether to read it aloud.
+
+    ``speak`` is the whole protocol — the handheld does not decide anything, it
+    plays the clip when this says to and remembers the id so it does not play
+    the same one twice. Only the PC currently on its screen is polled, which is
+    what keeps one machine's advice from being read out on a handheld that is
+    looking at another.
+    """
+    data = dict(source.collector.advisor.data)
+    audio = source.collector.audio
+    ready = bool(audio.get("path")) and audio.get("id") == data.get("id")
+    data["speak"] = bool(ready and cfg.get("speak_enabled")
+                         and data.get("level") == "warn")
+    data["audio_err"] = audio.get("err")
+    return data
+
+
+def advice_audio(source: FrameSource) -> tuple[str, bytes]:
+    """The current clip as ``(content type, bytes)``; empty when there is none."""
+    path = (source.collector.audio or {}).get("path")
+    if not path:
+        return "", b""
+    try:
+        with open(path, "rb") as fh:
+            body = fh.read()
+    except OSError:
+        return "", b""
+    ext = os.path.splitext(path)[1].lower()
+    return AUDIO_TYPES.get(ext, "application/octet-stream"), body
+
+
+PAGE_NAMES = ("总览", "详情")
+
+
+def preview_page(page: int | None) -> bytes:
+    # No page in the URL means "follow the handheld", which is its own state
+    # rather than a synonym for page 0 — so it gets its own link.
+    links = " · ".join(
+        [("<b>跟随掌机</b>" if page is None else '<a href="/preview">跟随掌机</a>')] +
+        [(f"<b>{name}</b>" if page == i else
+          f'<a href="/preview?page={i}">{name}</a>')
+         for i, name in enumerate(PAGE_NAMES)])
+    src = "/preview.mjpg" if page is None else f"/preview.mjpg?page={page}"
     return f"""<!doctype html><html lang="zh"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PC Monitor 预览</title><style>{PAGE_CSS}</style>
 <div class="wrap">
 <h1>实时预览</h1>
-<p class="sub">掌机上看到的画面，已转正。<a href="/settings">← 设置</a></p>
-<img class="prev" src="/preview.mjpg" alt="dashboard">
+<p class="sub">掌机上看到的画面，已转正。{links} · <a href="/settings">← 设置</a></p>
+<img class="prev" src="{src}" alt="dashboard">
 </div></html>""".encode("utf-8")
 
 
@@ -793,7 +1000,8 @@ class Handler(BaseHTTPRequestHandler):
     source: FrameSource  # injected below
     settings: Settings
 
-    QUIET_PATHS = ("/stats.json", "/config.json", "/battery", "/api/")
+    QUIET_PATHS = ("/stats.json", "/config.json", "/battery", "/api/",
+                   "/advice.json")
 
     def log_message(self, fmt, *args):
         if not self.path.startswith(self.QUIET_PATHS):
@@ -835,29 +1043,45 @@ class Handler(BaseHTTPRequestHandler):
             self._send("text/html; charset=utf-8",
                        settings_page(self.settings, self.source, message=msg))
         elif path == "/preview":
-            self._send("text/html; charset=utf-8", preview_page())
+            self._send("text/html; charset=utf-8",
+                       preview_page(self._page(query, None)))
         elif path == "/ai":
             self._send("text/html; charset=utf-8", ai_page(self.source))
         elif path == "/api/info":
             self._json(api_info(self.source, self.server.server_port))
         elif path == "/api/usage":
             self._json(api_usage(self.source))
+        elif path == "/advice.json":
+            self._json(advice_json(self.source, self.settings.snapshot()))
+        elif path == "/advice.audio":
+            ctype, body = advice_audio(self.source)
+            if not body:
+                self._send("text/plain", b"no audio", 404)
+            else:
+                self._send(ctype, body)
         elif path == "/stream.mjpg":
-            self._stream(("panel", self._orient(query), self._chrome(query),
-                          self.client_address[0]), multipart=False)
+            self._stream(("panel", self._orient(query), self._page(query),
+                          self._chrome(query), self.client_address[0]),
+                         multipart=False)
         elif path == "/battery":
             self._battery(query)
         elif path == "/preview.mjpg":
-            self._stream(self.source.preview_key(), multipart=True)
+            self._stream(self.source.preview_key(self._page(query, None)),
+                         multipart=True)
         elif path == "/frame.jpg":
-            frame, _ = self.source.wait_frame(self.source.preview_key(), -1)
+            frame = self.source.one_frame(
+                self.source.preview_key(self._page(query, None)))
             if frame is None:
                 self._send("text/plain", b"no frame yet", 503)
             else:
                 self._send("image/jpeg", frame)
         elif path == "/config.json":
+            # The page count comes from here rather than being hardcoded in the
+            # launcher, so adding a page to the dashboard does not mean pushing a
+            # new script to every handheld.
             body = json.dumps(dict(self.settings.snapshot(),
-                                   name=socket.gethostname())).encode("utf-8")
+                                   name=socket.gethostname(),
+                                   pages=render.PAGE_COUNT)).encode("utf-8")
             self._send("application/json", body)
         elif path == "/stats.json":
             body = json.dumps(self.source.snapshot, ensure_ascii=False,
@@ -876,8 +1100,8 @@ class Handler(BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(raw)
         changes = {k: v[-1] for k, v in form.items() if k in EDITABLE}
         # An unchecked checkbox is simply absent from the POST body.
-        if "rotate180" not in changes:
-            changes["rotate180"] = "0"
+        for key in CHECKBOXES:
+            changes.setdefault(key, "0")
         # A blank key field means "keep what is stored"; clearing one is an
         # explicit tick, so an ordinary save can never wipe a key by omission.
         for key in SECRET_KEYS:
@@ -936,6 +1160,17 @@ class Handler(BaseHTTPRequestHandler):
             return int(query.get("orient", ["0"])[0]) % 4
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _page(query: dict, default: int | None = 0) -> int | None:
+        """Which page the client wants. The browser's default is "whichever the
+        handheld is on", which is a different thing from page 0."""
+        if "page" not in query:
+            return default
+        try:
+            return int(query["page"][0]) % render.PAGE_COUNT
+        except (TypeError, ValueError):
+            return default
 
     # Guard rails, because this arrives from the network: the strip is drawn from
     # these strings, and an unbounded list would mean unbounded variants to render.

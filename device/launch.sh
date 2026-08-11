@@ -5,11 +5,13 @@
 # stream full-screen, which is well within a Cortex-A7's budget.
 #
 # Controls:  LEFT / RIGHT  switch between discovered PCs (listed on screen)
+#            UP / DOWN     turn the page (overview / detail)
 #            Y             rotate the display (4 steps, portrait included)
 #            MENU          quit
 #
 # The handheld's own battery level is reported to the PC so it can be drawn in the
-# header, and a low battery buzzes the motor.
+# header, and a low battery buzzes the motor. If the PC has AI advice with speech
+# turned on, the clip it generated is played here — only for the PC on screen.
 #
 # Buttons are read straight from /dev/input/event0. evdev delivers events to
 # every reader, so this works alongside ffplay's own SDL input. The device is
@@ -17,9 +19,10 @@
 # silently drops any event that arrived in between.
 #
 # The frame rate and the orientation both live on the PC side — the rate is read
-# from /config.json on each connect, and the orientation and the discovered device
-# list are passed as query parameters so the PC renders the matching layout and
-# switcher. Nothing here needs to know how the dashboard is drawn.
+# from /config.json on each connect, and the orientation, the page and the
+# discovered device list are passed as query parameters so the PC renders the
+# matching layout and switcher. Nothing here needs to know how the dashboard is
+# drawn, or even how many pages it has: that comes from /config.json too.
 
 progdir=$(dirname "$0")
 sysdir=/mnt/SDCARD/.tmp_update
@@ -32,12 +35,15 @@ stopflag=/tmp/pcmon_stop
 sweepflag=/tmp/pcmon_sweep
 pidfile=/tmp/pcmon_player
 targetfile=/tmp/pcmon_target
+audiofile=/tmp/pcmon_advice
 selfpid="$progdir/.pid"
 
 # evdev key codes on the Miyoo Mini.
 KEY_MENU=1
 KEY_LEFT=105
 KEY_RIGHT=106
+KEY_UP=103
+KEY_DOWN=108
 KEY_Y=56
 
 PC_HOST=192.168.2.114
@@ -47,10 +53,15 @@ DISCOVER_EVERY_S=120
 BATT_EVERY_S=60
 BATT_LOW_PCT=15
 BATT_BUZZ_GAP_S=600
+SPEAK_EVERY_S=60
 [ -f "$progdir/settings.cfg" ] && . "$progdir/settings.cfg"
 
 IDX=0
 ORIENT=0
+PAGE=0
+# How many pages the PC draws. Replaced by whatever /config.json reports on each
+# connect; this is only what to assume before the first one answers.
+PAGES=2
 [ -f "$state" ] && . "$state"
 
 export LD_LIBRARY_PATH="$sysdir/lib:/mnt/SDCARD/miyoo/lib:$LD_LIBRARY_PATH"
@@ -61,7 +72,17 @@ export HOME=/mnt/SDCARD
 
 say() { echo "$(date '+%H:%M:%S') $*" >> "$log"; }
 
-save_state() { printf 'IDX=%s\nORIENT=%s\n' "$IDX" "$ORIENT" > "$state"; }
+save_state() {
+	printf 'IDX=%s\nORIENT=%s\nPAGE=%s\n' "$IDX" "$ORIENT" "$PAGE" > "$state"
+}
+
+# Both directions exist even though there are only two pages today: UP and DOWN
+# are how you would expect to walk a list, and the count comes from the PC.
+turn_page() {
+	[ "$PAGES" -ge 1 ] || PAGES=1
+	PAGE=$(((PAGE + PAGES + $1) % PAGES))
+	save_state
+}
 
 host_count() {
 	c=$(wc -l < "$hosts" 2>/dev/null)
@@ -235,6 +256,58 @@ battery_loop() {
 	done
 }
 
+# --- spoken advice ---------------------------------------------------------
+# The PC decides everything: whether there is advice, whether it is worth saying
+# out loud, and what it sounds like. All this does is poll the PC that is
+# currently on screen, and play the clip once per advice id — which is also what
+# makes the announcement follow the device switcher rather than the LAN. Switch
+# to another PC and you hear that PC's advice, not this one's.
+#
+# The video player runs with SDL_AUDIODRIVER=dummy because it has no audio and
+# should not hold the device open. Clearing it for this one command lets SDL pick
+# a real driver here without disturbing the stream.
+speak_play() {
+	SDL_AUDIODRIVER= "$BIN/ffplay" -hide_banner -loglevel error \
+		-nodisp -autoexit -i "$1" >> "$log" 2>&1
+}
+
+speak_loop() {
+	spoken=""
+	seen_target=""
+	while [ ! -f "$stopflag" ]; do
+		target=$(cat "$targetfile" 2>/dev/null)
+		if [ -n "$target" ]; then
+			# A different PC has its own advice numbering, so the "already
+			# said this one" memory has to be per PC or the first advice from
+			# the machine you just switched to would be swallowed.
+			if [ "$target" != "$seen_target" ]; then
+				seen_target=$target
+				spoken=""
+			fi
+			js=$("$BIN/curl" -s -m 5 "$target/advice.json")
+			id=$(printf '%s' "$js" | "$BIN/jq" -r '.id // empty' 2>/dev/null)
+			say_it=$(printf '%s' "$js" |
+				"$BIN/jq" -r 'if .speak then 1 else 0 end' 2>/dev/null)
+			if [ -n "$id" ] && [ "$say_it" = "1" ] && [ "$id" != "$spoken" ]; then
+				if "$BIN/curl" -s -m 20 -f -o "$audiofile" \
+					"$target/advice.audio"; then
+					spoken=$id
+					say "advice $id from $target, speaking"
+					speak_play "$audiofile"
+				else
+					say "advice $id has no audio yet"
+				fi
+			fi
+		fi
+
+		i=0
+		while [ $i -lt "$SPEAK_EVERY_S" ] && [ ! -f "$stopflag" ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+	done
+}
+
 # --- button reader ---------------------------------------------------------
 # Writes an action then kills ffplay, in that order, so the main loop always
 # finds the action already waiting when ffplay returns.
@@ -252,6 +325,8 @@ keyreader() {
 		case "$6" in
 			"$KEY_LEFT") echo prev > "$cmdfile" ;;
 			"$KEY_RIGHT") echo next > "$cmdfile" ;;
+			"$KEY_UP") echo pageup > "$cmdfile" ;;
+			"$KEY_DOWN") echo pagedown > "$cmdfile" ;;
 			"$KEY_Y") echo rotate > "$cmdfile" ;;
 			"$KEY_MENU") echo quit > "$cmdfile" ;;
 			*)
@@ -336,8 +411,9 @@ cleanup() {
 	[ -n "$KR_PID" ] && kill "$KR_PID" 2>/dev/null
 	[ -n "$DISC_PID" ] && kill "$DISC_PID" 2>/dev/null
 	[ -n "$BATT_PID" ] && kill "$BATT_PID" 2>/dev/null
+	[ -n "$SPEAK_PID" ] && kill "$SPEAK_PID" 2>/dev/null
 	[ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null
-	rm -f "$targetfile" "$sweepflag"
+	rm -f "$targetfile" "$sweepflag" "$audiofile"
 	echo ondemand > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
 }
 trap 'cleanup; exit 0' INT TERM
@@ -375,13 +451,15 @@ discover_loop &
 DISC_PID=$!
 battery_loop &
 BATT_PID=$!
+speak_loop &
+SPEAK_PID=$!
 # The stub player holds no socket, so the watchdog would kill it on sight.
 if [ -z "$PCMON_TEST_PLAY" ]; then
 	watchdog &
 	WD_PID=$!
 fi
 
-say "start idx=$IDX orient=$ORIENT"
+say "start idx=$IDX orient=$ORIENT page=$PAGE"
 
 while :; do
 	total=$(host_count)
@@ -405,6 +483,8 @@ while :; do
 			quit) break ;;
 			next) IDX=$((IDX + 1)); save_state; continue ;;
 			prev) IDX=$((IDX - 1)); save_state; continue ;;
+			pageup) turn_page -1; continue ;;
+			pagedown) turn_page 1; continue ;;
 			rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state; continue ;;
 			# A fresh list may well contain a host that is actually up.
 			refresh) continue ;;
@@ -420,9 +500,19 @@ while :; do
 		'' | *[!0-9]*) rate=$STREAM_FPS ;;
 	esac
 
+	# An older PC build does not report a page count; it also only has one page,
+	# so falling back to 1 is what keeps UP and DOWN from asking it for a page
+	# it cannot draw.
+	pages=$(printf '%s' "$conf" | "$BIN/jq" -r '.pages // empty' 2>/dev/null)
+	case "$pages" in
+		'' | 0 | *[!0-9]*) PAGES=1 ;;
+		*) PAGES=$pages ;;
+	esac
+	[ "$PAGE" -ge "$PAGES" ] && PAGE=0
+
 	devs=$(device_list)
-	say "connect $host idx=$IDX/$total orient=$ORIENT rate=$rate devs=$devs"
-	play "$base/stream.mjpg?orient=$ORIENT&devs=$devs&i=$IDX" "$rate"
+	say "connect $host idx=$IDX/$total orient=$ORIENT page=$PAGE/$PAGES rate=$rate devs=$devs"
+	play "$base/stream.mjpg?orient=$ORIENT&page=$PAGE&devs=$devs&i=$IDX" "$rate"
 	say "ffplay exit $?"
 
 	take_cmd
@@ -438,6 +528,8 @@ while :; do
 		quit) break ;;
 		next) IDX=$((IDX + 1)); save_state ;;
 		prev) IDX=$((IDX - 1)); save_state ;;
+		pageup) turn_page -1 ;;
+		pagedown) turn_page 1 ;;
 		rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state ;;
 		refresh)
 			# Discovery rewrote the list; stay on this PC if it is still in it,

@@ -42,6 +42,8 @@ C_DOWN = (201, 133, 0)
 C_UP = (213, 81, 129)
 C_FPS = (144, 133, 233)
 C_AI = (0, 150, 163)
+C_PWR = (166, 118, 84)
+C_DISK = (127, 118, 191)
 
 # --- reserved status hues (never used as a series) ---
 S_GOOD = (12, 163, 12)
@@ -122,6 +124,52 @@ def ellipsize(draw, text: str, font, max_w: int) -> str:
     while text and draw.textlength(text + "…", font=font) > max_w:
         text = text[:-1]
     return text + "…"
+
+
+NO_LINE_START = "，。、；：？！）》」』】…%°"
+
+
+def wrap(draw, text: str, font, max_w: int, max_lines: int = 99) -> list[str]:
+    """Break a paragraph to width, one character at a time.
+
+    Character-wise rather than word-wise because the text this exists for is
+    Chinese, which has no spaces to break at; an ASCII run that would be split
+    mid-word is moved down to the next line instead, which keeps the occasional
+    embedded process name readable. The last line is ellipsized rather than
+    dropped, so a truncated paragraph never looks like a complete one.
+    """
+    lines: list[str] = []
+    line = ""
+    for ch in text.replace("\r", ""):
+        if ch == "\n":
+            lines.append(line)
+            line = ""
+            continue
+        if not line or draw.textlength(line + ch, font=font) <= max_w:
+            line += ch
+            continue
+        cut = len(line)
+        if ch.isascii() and not ch.isspace():
+            # Walk back to the start of the ASCII run, unless that is the whole
+            # line — a single long token has to be broken somewhere.
+            while cut > 0 and line[cut - 1].isascii() and not line[cut - 1].isspace():
+                cut -= 1
+            if cut == 0:
+                cut = len(line)
+        # Chinese punctuation never opens a line: pull the preceding character
+        # down with it rather than leaving a comma hanging at the left margin.
+        first = line[cut] if cut < len(line) else ch
+        if first in NO_LINE_START and cut > 1:
+            cut -= 1
+        lines.append(line[:cut].rstrip())
+        line = line[cut:] + ch
+    if line:
+        lines.append(line)
+
+    if len(lines) > max_lines:
+        tail = "".join(lines[max_lines - 1:])
+        lines = lines[:max_lines - 1] + [ellipsize(draw, tail, font, max_w)]
+    return lines
 
 
 def tile(d, box, fonts, title: str, meta: str = "") -> None:
@@ -303,8 +351,11 @@ def _fps_tile(img, d, f, s, box) -> None:
 
     if v is None:
         d.text((ix0, y), "—", font=hero, fill=MUTED)
-        hint = ("请启动 MSI Afterburner / RTSS" if not fps["rtss"]
-                else "前台没有游戏画面")
+        if not fps["rtss"]:
+            hint = ("请启动 MSI Afterburner / RTSS" if ix1 - ix0 >= 220
+                    else "需 Afterburner / RTSS")
+        else:
+            hint = "前台没有游戏画面"
         d.text((ix0, y + (54 if roomy else 42)), ellipsize(d, hint, f.sub, ix1 - ix0),
                font=f.sub, fill=INK2)
         return
@@ -312,9 +363,14 @@ def _fps_tile(img, d, f, s, box) -> None:
     d.text((ix0, y), f"{v:.0f}", font=hero, fill=state_color)
     hw = d.textlength(f"{v:.0f}", font=hero)
     d.text((ix0 + 5 + hw, y + (30 if roomy else 22)), "FPS", font=f.sub, fill=MUTED)
-    label = f"{fps['frametime_ms']:.1f} ms · {fps['process'] or ''}"
+    # In a narrow tile the process name would ellipsize down to two letters, so
+    # it yields to the frame time, which is short and always means something.
+    room = ix1 - ix0 - hw - 42
+    label = f"{fps['frametime_ms']:.1f} ms"
+    if room >= 110 and fps["process"]:
+        label += f" · {fps['process']}"
     d.text((ix0 + 5 + hw + 32, y + (30 if roomy else 22)),
-           ellipsize(d, label, f.tiny, ix1 - ix0 - hw - 42), font=f.tiny, fill=MUTED)
+           ellipsize(d, label, f.tiny, room), font=f.tiny, fill=MUTED)
 
     sb = _spark_box(box, y + (54 if roomy else 44))
     if sb:
@@ -346,30 +402,20 @@ def _gpu_tile(img, d, f, s, box) -> None:
     y += 30
     meter(d, (ix0, y, ix1, y + 8), g["percent"] / 100.0, C_GPU)
     y += 12
+
+    frac = g["mem_used_gb"] / g["mem_total_gb"] if g["mem_total_gb"] else 0.0
+    label = f"显存 {g['mem_used_gb']:.1f} / {g['mem_total_gb']:.1f} GB"
     if y1 - y >= 26:
-        d.text((ix0, y), f"显存 {g['mem_used_gb']:.1f} / {g['mem_total_gb']:.1f} GB",
-               font=f.tiny, fill=MUTED)
-        y += 15
-        frac = g["mem_used_gb"] / g["mem_total_gb"] if g["mem_total_gb"] else 0.0
-        meter(d, (ix0, y, ix1, y + 7), frac, C_GPU)
-
-
-def _mem_slim(img, d, f, s, box) -> None:
-    """Memory as a single labelled bar — it is the least volatile number here."""
-    x0, y0, x1, y1 = box
-    m = s["mem"]
-    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
-    cy = (y0 + y1) // 2
-    d.text((x0 + PADI, cy), "内存", font=f.label, fill=INK2, anchor="lm")
-    text = f"{m['used_gb']:.1f} / {m['total_gb']:.0f} GB"
-    d.text((x0 + PADI + 42, cy), text, font=f.row, fill=INK, anchor="lm")
-    tw = d.textlength(text, font=f.row)
-    d.text((x1 - PADI, cy), f"{m['percent']:.0f}%", font=f.meta, fill=INK2,
-           anchor="rm")
-    bx0 = x0 + PADI + 52 + tw
-    bx1 = x1 - PADI - 34
-    if bx1 - bx0 > 30:
-        meter(d, (bx0, cy - 4, bx1, cy + 4), m["percent"] / 100.0, C_MEM)
+        d.text((ix0, y), label, font=f.tiny, fill=MUTED)
+        meter(d, (ix0, y + 15, ix1, y + 22), frac, C_GPU)
+    elif y1 - y >= 12:
+        # Short tile: the VRAM label and its bar share one line rather than the
+        # bar being dropped, because "how full is the card" is the reading this
+        # tile exists for on a machine that is running a game.
+        d.text((ix0, y), label, font=f.tiny, fill=MUTED)
+        bx0 = ix0 + d.textlength(label, font=f.tiny) + 8
+        if ix1 - bx0 >= 24:
+            meter(d, (bx0, y + 3, ix1, y + 9), frac, C_GPU)
 
 
 # --- AI quota -------------------------------------------------------------
@@ -403,26 +449,18 @@ def _quota_cell(label: str, window) -> tuple:
 
 
 def _ai_cells(ai: dict) -> list[tuple]:
-    """Seven gauges in a fixed order — position is how they are found at a glance.
+    """Five gauges in a fixed order — position is how they are found at a glance.
 
     Providers that are not configured keep their slot and show a dash rather
     than collapsing the row, so the layout never moves under the eye.
+
+    The Opus and extra-usage windows are deliberately absent: neither is a
+    quota you pace yourself against on this dashboard, and dropping them buys
+    the remaining five gauges enough width to carry their reset countdowns.
     """
     claude = ai.get("claude") or {}
     cells = [_quota_cell("C 5h", claude.get("five_hour")),
-             _quota_cell("C 7d", claude.get("seven_day")),
-             _quota_cell("Opus", claude.get("seven_day_opus"))]
-
-    extra = claude.get("extra") or {}
-    used = extra.get("used")
-    if used is None:
-        cells.append(("额外", "—", None, MUTED))
-    else:
-        # Extra usage is dollars, not a share of anything, so the bar is a state:
-        # full when credits can still be spent, empty when they cannot.
-        on = bool(extra.get("enabled"))
-        cells.append(("额外", _money(used, extra.get("currency")),
-                      1.0 if on else None, INK if on else INK2))
+             _quota_cell("C 7d", claude.get("seven_day"))]
 
     ds = ai.get("deepseek") or {}
     if not ds.get("ok") or ds.get("balance") is None:
@@ -441,65 +479,144 @@ def _ai_cells(ai: dict) -> list[tuple]:
     return cells
 
 
-def _ai_note(ai: dict) -> str:
+def _reset_ink(ts: float | None):
+    """Reset countdowns are the one thing on this line you act on."""
+    if not ts:
+        return MUTED
+    return S_WARN if ts - time.time() < 3600 else INK
+
+
+def _ai_runs(ai: dict) -> list[list[tuple[str, tuple]]]:
+    """The note beside the gauges, as chunks of coloured runs.
+
+    Chunks are joined with a muted separator; within a chunk the label stays
+    muted and the countdown takes ink, because at a uniform grey the reset time
+    read as part of the label next to it and was effectively invisible.
+    """
     claude = ai.get("claude")
     if not claude:
-        return "读取中…"
+        return [[("读取中…", MUTED)]]
     if not claude.get("five_hour"):
         err = claude.get("err")
-        return {"no-creds": "未登录 Claude Code",
+        text = {"no-creds": "未登录 Claude Code",
                 "no-token": "凭据里没有令牌",
                 "rate-limited": "接口限流，稍后重试",
                 "offline": "连不上 Anthropic"}.get(err, f"Claude 出错：{err}")
+        return [[(text, MUTED)]]
 
-    parts = [f"Claude {(claude.get('plan') or '').capitalize()}".strip()]
+    plan = f"Claude {(claude.get('plan') or '').capitalize()}".strip()
+    chunks: list[list[tuple[str, tuple]]] = [[(plan, MUTED)]]
     for key, name in (("five_hour", "5小时"), ("seven_day", "7天")):
         window = claude.get(key)
         if window and window.get("resets_at"):
-            parts.append(f"{name} {_until(window['resets_at'])}重置")
+            ts = window["resets_at"]
+            chunks.append([(name + " ", MUTED),
+                           (_until(ts) + "重置", _reset_ink(ts))])
     if not claude.get("ok"):
-        parts.append("数据可能过期")
-    return " · ".join(parts)
+        chunks.append([("数据可能过期", S_WARN)])
+    return chunks
+
+
+def _draw_runs(d, x, y, chunks, font, limit: float) -> None:
+    """Coloured runs on one line, separated by a muted dot, truncated to fit."""
+    for i, chunk in enumerate(chunks):
+        parts = ([(" · ", MUTED)] if i else []) + list(chunk)
+        width = sum(d.textlength(t, font=font) for t, _ in parts)
+        if x + width > limit:
+            return
+        for text, ink in parts:
+            d.text((x, y), text, font=font, fill=ink)
+            x += d.textlength(text, font=font)
+
+
+# A window's own length, so how far into it we are can be worked out from the
+# reset time alone — the API reports when it ends, never when it began.
+_WINDOW_S = {"five_hour": 5 * 3600.0, "seven_day": 7 * 86400.0}
+
+
+def _pace(window, length: float):
+    """(burn rate, elapsed fraction, percent used) for one quota window.
+
+    Burn rate is usage divided by how much of the window has gone by, so 1.0 is
+    exactly even pacing, 2.0 is twice as fast as the window can sustain. Returns
+    None in the first few percent of a window, where the ratio is dominated by
+    whatever happened in the last minute.
+    """
+    if not window:
+        return None
+    pct, resets_at = window.get("pct"), window.get("resets_at")
+    if pct is None or not resets_at:
+        return None
+    frac = 1.0 - (resets_at - time.time()) / length
+    if not 0.08 <= frac <= 1.0:
+        return None
+    return pct / 100.0 / frac, frac, pct
+
+
+def _ai_hint(ai: dict):
+    """Whether to ease off or spend freely, as (text, ink) — or None if neither.
+
+    The judgement is about pace, not level: 60% used is alarming three hours
+    into a five-hour window and reassuring six days into a seven-day one. Only
+    the two windows that actually gate work are considered, and the more urgent
+    of them wins, because it is the one that will stop you first.
+    """
+    claude = ai.get("claude") or {}
+    rows = [r for r in (_pace(claude.get(key), length)
+                        for key, length in _WINDOW_S.items()) if r]
+    if not rows:
+        return None
+
+    burn, _frac, pct = max(rows, key=lambda r: r[0])
+    # A high ratio on a barely-touched window is arithmetic, not a warning.
+    if burn >= 1.25 and pct >= 20:
+        return ("用得偏快，建议节制", S_CRIT if burn >= 1.6 else S_WARN)
+
+    burn, frac, _pct = min(rows, key=lambda r: r[0])
+    # Unused quota expires at the reset, so late in a window an untouched one is
+    # something to spend, not something to protect.
+    if burn <= 0.6 and frac >= 0.35:
+        return ("额度富余，可尽快使用", S_GOOD)
+    return None
 
 
 def _ai_tile(img, d, f, s, box) -> None:
     """Every quota this machine can see, as a row of small gauges.
 
     Two shapes from one renderer: given enough height the tile takes a title and
-    stacks the gauges two deep; in the landscape strip it drops the title bar,
-    puts all seven on one line and spends the freed row on the reset countdowns,
-    which is the part a title could never carry.
+    puts the reset countdowns on a line of their own; in the landscape strip it
+    drops the title bar and folds the title into that same line, so the gauges
+    keep their full height either way.
     """
     x0, y0, x1, y1 = box
     ix0, ix1 = x0 + PADI, x1 - PADI
     ai = s.get("ai") or {}
     cells = _ai_cells(ai)
-    note = _ai_note(ai)
+    chunks = _ai_runs(ai)
+    hint = _ai_hint(ai)
     roomy = (y1 - y0) >= 56
 
     if roomy:
-        tile(d, box, f, "AI 额度", ellipsize(d, note, f.meta, (x1 - x0) * 0.68))
-        top, bottom, rows = y0 + TITLE_H, y1 - 6, 2
+        tile(d, box, f, "AI 额度")
+        top, bottom = y0 + TITLE_H, y1 - 18
     else:
         d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
-        top, bottom, rows = y0 + 4, y1 - 16, 1
+        top, bottom = y0 + 4, y1 - 16
+        chunks = [[("AI 额度", INK2)]] + chunks
 
-    cols = int(math.ceil(len(cells) / rows))
-    cw = (ix1 - ix0) / cols
-    row_h = (bottom - top) / rows
+    cw = (ix1 - ix0) / len(cells)
+    row_h = bottom - top
 
     for i, (label, value, frac, ink) in enumerate(cells):
-        r, c = divmod(i, cols)
-        cx = ix0 + c * cw
-        cy = top + r * row_h
+        cx = ix0 + i * cw
         cell_w = cw - 10
         vw = d.textlength(value, font=f.row)
-        d.text((cx, cy + 1), ellipsize(d, label, f.tiny, cell_w - vw - 5),
+        d.text((cx, top + 1), ellipsize(d, label, f.tiny, cell_w - vw - 5),
                font=f.tiny, fill=MUTED)
-        d.text((cx + cell_w, cy), value, font=f.row, fill=ink, anchor="ra")
+        d.text((cx + cell_w, top), value, font=f.row, fill=ink, anchor="ra")
         # Bottom-anchored so the bar survives the shortest row either layout
         # asks for; below that there is no room for it at all.
-        by = cy + row_h - 6
+        by = top + row_h - 6
         if row_h >= 20:
             if frac is None:
                 d.rounded_rectangle((cx, by, cx + cell_w, by + 6), radius=3,
@@ -507,9 +624,104 @@ def _ai_tile(img, d, f, s, box) -> None:
             else:
                 meter(d, (cx, by, cx + cell_w, by + 6), frac, C_AI)
 
-    if not roomy:
-        d.text((ix0, y1 - 15), ellipsize(d, "AI 额度 · " + note, f.tiny,
-                                         ix1 - ix0), font=f.tiny, fill=MUTED)
+    # The hint is the only coloured text on the line, and it is anchored right so
+    # it holds still while the countdowns beside it change width every second.
+    note_y = y1 - 15
+    limit = ix1
+    if hint:
+        text, ink = hint
+        d.text((ix1, note_y), text, font=f.tiny, fill=ink, anchor="ra")
+        limit = ix1 - d.textlength(text, font=f.tiny) - 12
+    _draw_runs(d, ix0, note_y, chunks, f.tiny, limit)
+
+
+AI_ROW_H = 20
+
+
+def _ai_detail_rows(ai: dict) -> list[tuple]:
+    """Every quota window in full, as (label, value, fraction, ink, reset).
+
+    This is where the windows page 1 has no room for end up — Opus, extra usage,
+    and MiniMax's per-model groups. Page 1 answers "am I about to run out";
+    this answers "out of what, exactly, and when does it come back".
+    """
+    rows: list[tuple] = []
+    claude = ai.get("claude") or {}
+    for key, name in (("five_hour", "Claude 5 小时"),
+                      ("seven_day", "Claude 7 天"),
+                      ("seven_day_opus", "Claude 7 天 Opus")):
+        window = claude.get(key) or {}
+        label, value, frac, ink = _quota_cell(name, claude.get(key))
+        rows.append((label, value, frac, ink, window.get("resets_at")))
+
+    extra = claude.get("extra") or {}
+    if extra.get("used") is not None:
+        on = bool(extra.get("enabled"))
+        rows.append(("Claude 额外用量",
+                     _money(extra["used"], extra.get("currency")),
+                     1.0 if on else None, INK if on else INK2, None))
+
+    ds = ai.get("deepseek") or {}
+    if ds.get("balance") is not None:
+        on = bool(ds.get("available"))
+        rows.append(("DeepSeek 余额", _money(ds["balance"], ds.get("currency")),
+                     1.0 if on else None, INK if on else S_CRIT, None))
+
+    mm = ai.get("minimax") or {}
+    groups = mm.get("models") or ([{"name": mm.get("model") or "general",
+                                    "five_hour": mm.get("five_hour"),
+                                    "weekly": mm.get("weekly"),
+                                    "five_hour_reset": mm.get("five_hour_reset"),
+                                    "weekly_reset": mm.get("weekly_reset")}]
+                                  if mm.get("ok") else [])
+    for group in groups:
+        for key, suffix in (("five_hour", "5 小时"), ("weekly", "周")):
+            value = group.get(key)
+            if value is None:
+                continue
+            label, text, frac, ink = _quota_cell(
+                f"MiniMax {group.get('name') or '?'} {suffix}", {"pct": value})
+            rows.append((label, text, frac, ink, group.get(key + "_reset")))
+    return rows
+
+
+def _ai_detail_tile(img, d, f, s, box) -> None:
+    """The full quota table, one window per row with its own reset countdown."""
+    x0, y0, x1, y1 = box
+    ix0, ix1 = x0 + PADI, x1 - PADI
+    rows = _ai_detail_rows(s.get("ai") or {})
+    tile(d, box, f, "AI 额度明细")
+
+    top = y0 + TITLE_H
+    fits = max(0, int((y1 - 6 - top) // AI_ROW_H))
+    rows = rows[:fits]
+    # One shared left edge for every bar, and one shared right edge: a track
+    # whose length depended on how long its label happened to be would make the
+    # rows impossible to compare, which is the only reason to draw bars at all.
+    bx0 = ix0 + max([d.textlength(r[0], font=f.tiny) for r in rows] or [0]) + 12
+    bx1 = ix1 - max([d.textlength(r[1], font=f.row) for r in rows] or [0]) - 62
+
+    for i, (label, value, frac, ink, reset) in enumerate(rows):
+        ry = top + i * AI_ROW_H
+        d.text((ix0, ry + 3), label, font=f.tiny, fill=INK2)
+        d.text((ix1, ry + 1), value, font=f.row, fill=ink, anchor="ra")
+
+        until = _until(reset)
+        if until:
+            d.text((bx1 + 8, ry + 3), until, font=f.tiny,
+                   fill=_reset_ink(reset))
+
+        if bx1 - bx0 >= 30:
+            if frac is None:
+                d.rounded_rectangle((bx0, ry + 6, bx1, ry + 12), radius=3,
+                                    fill=blend(C_AI, SURFACE, 0.16))
+            else:
+                meter(d, (bx0, ry + 6, bx1, ry + 12), frac, C_AI)
+
+
+def _ai_detail_height(s: dict, avail: int) -> int:
+    rows = len(_ai_detail_rows(s.get("ai") or {}))
+    return max(0, min(avail, TITLE_H + AI_ROW_H * rows + 8))
 
 
 # --- weather --------------------------------------------------------------
@@ -557,13 +769,84 @@ def _weather_slim(img, d, f, s, box) -> None:
         cx += width + 9
 
 
+# --- AI advice ------------------------------------------------------------
+
+def _ago(ts: float | None) -> str:
+    if not ts:
+        return ""
+    rem = time.time() - ts
+    if rem < 90:
+        return "刚刚"
+    if rem < 5400:
+        return f"{int(rem // 60)} 分钟前"
+    return f"{int(rem // 3600)} 小时前"
+
+
+ADVICE_LINE_H = 18
+
+
+def _advice_height(d, f, s, width: int, avail: int) -> int:
+    """As tall as the paragraph needs, never taller.
+
+    The advice is one line on a healthy machine and a short paragraph on a sick
+    one, so a box sized for the worst case would usually be a large empty panel.
+    Ending the tile early leaves plain background instead, which reads as
+    "nothing more to show" rather than "something failed to load".
+    """
+    text = (s.get("advice") or {}).get("text") or ""
+    lines = len(wrap(d, text, f.sub, width - 2 * PADI - 16)) if text else 1
+    return max(56, min(avail, TITLE_H + ADVICE_LINE_H * lines + 10))
+
+
+def _advice_tile(img, d, f, s, box) -> None:
+    """The last thing the advisor said, wrapped to the tile.
+
+    Silence is the normal state: when nothing is wrong the advisor is asked to
+    say so in one word, and this shows that rather than inventing filler, so a
+    paragraph on screen always means something actually wanted attention.
+    """
+    x0, y0, x1, y1 = box
+    ix0, ix1 = x0 + PADI, x1 - PADI
+    a = s.get("advice") or {}
+
+    meta = " · ".join(p for p in (a.get("provider") or "", _ago(a.get("at"))) if p)
+    tile(d, box, f, "AI 建议", meta)
+
+    body = y0 + TITLE_H
+    if not a.get("enabled"):
+        d.text((ix0, body), "未开启（在设置页打开）", font=f.sub, fill=MUTED)
+        return
+    text = a.get("text") or ""
+    if not text:
+        d.text((ix0, body), a.get("err") or "还没有分析结果", font=f.sub, fill=MUTED)
+        return
+
+    warn = a.get("level") == "warn"
+    dot(d, ix0, body + 4, S_WARN if warn else S_GOOD, 4)
+    lines = wrap(d, text, f.sub, ix1 - ix0 - 16,
+                 max_lines=max(1, int((y1 - 6 - body) // ADVICE_LINE_H)))
+    for i, line in enumerate(lines):
+        d.text((ix0 + 16, body + i * ADVICE_LINE_H), line, font=f.sub,
+               fill=INK if warn else INK2)
+
+
 # --- process tables -------------------------------------------------------
 
-def _proc_tile(img, d, f, box, title, rows, color, empty: str) -> None:
+def _as_pct(value: float) -> str:
+    return f"{value:.0f}%" if value >= 10 else f"{value:.1f}%"
+
+
+def _as_mb(value: float) -> str:
+    """Process memory: gigabytes once it gets there, so the column stays short."""
+    return f"{value / 1024:.1f} GB" if value >= 1024 else f"{value:.0f} MB"
+
+
+def _proc_tile(img, d, f, box, title, rows, color, empty: str, fmt=_as_pct,
+               meta: str = "") -> None:
     """Top consumers as a small ranked table: mark, name, share."""
     x0, y0, x1, y1 = box
     ix0, ix1 = x0 + PADI, x1 - PADI
-    tile(d, box, f, title)
+    tile(d, box, f, title, meta)
 
     if not rows:
         d.text((ix0, y0 + TITLE_H + 2), empty, font=f.tiny, fill=MUTED)
@@ -573,15 +856,223 @@ def _proc_tile(img, d, f, box, title, rows, color, empty: str) -> None:
     avail = y1 - 6 - top
     n = min(len(rows), 3)
     row_h = min(24, avail / max(1, n))
-    for i, (name, pct) in enumerate(rows[:n]):
+    for i, (name, value) in enumerate(rows[:n]):
         ry = top + i * row_h
         dot(d, ix0, ry + row_h / 2 - 3, color, 3)
-        pct_text = f"{pct:.0f}%" if pct >= 10 else f"{pct:.1f}%"
-        pw = d.textlength(pct_text, font=f.row)
-        d.text((ix1, ry + row_h / 2), pct_text, font=f.row, fill=INK, anchor="rm")
+        value_text = fmt(value)
+        pw = d.textlength(value_text, font=f.row)
+        d.text((ix1, ry + row_h / 2), value_text, font=f.row, fill=INK, anchor="rm")
         d.text((ix0 + 12, ry + row_h / 2),
                ellipsize(d, name, f.meta, ix1 - ix0 - pw - 22),
                font=f.meta, fill=INK2, anchor="lm")
+
+
+# --- energy ---------------------------------------------------------------
+
+def _power_strip(img, d, f, s, box) -> None:
+    """Draw right now, and what it has added up to over three windows.
+
+    Laid out along a line rather than as a table: the windows nest — today is
+    inside the week is inside the month — so the only relationship between them
+    is order, and reading left to right in increasing span says exactly that.
+
+    Where the line does not fit, the windows drop to a second row rather than
+    being truncated. The 30-day figure is the one this tile exists for, and a
+    strip that quietly stopped after "近 7 天" would be worse than useless.
+    """
+    x0, y0, x1, y1 = box
+    p = s.get("power") or {}
+    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    limit = x1 - PADI
+
+    days = int(p.get("days") or 0)
+    meta = "估算" if p.get("estimated") else ""
+    if days < 30:
+        meta = (meta + " · " if meta else "") + f"已记录 {days} 天"
+
+    windows = [("今日", f"{float(p.get('d1') or 0.0):.2f}"),
+               ("近 7 天", f"{float(p.get('d7') or 0.0):.2f}"),
+               ("近 30 天", f"{float(p.get('d30') or 0.0):.2f} kWh")]
+    cost = p.get("cost30")
+    if cost:
+        windows.append(("电费", _money(cost, "CNY")))
+
+    def window_w(row) -> float:
+        return sum(d.textlength(n, font=f.tiny) + 5
+                   + d.textlength(v, font=f.row) + 16 for n, v in row)
+
+    watts = f"{float(p.get('watts') or 0.0):.0f}"
+    head_w = (d.textlength("耗电量", font=f.label) + 12 + 13
+              + d.textlength(watts, font=f.value_xs) + 25)
+    meta_w = (d.textlength(meta, font=f.tiny) + 14) if meta else 0.0
+
+    # Two rows only when one will not do and the box is tall enough for them.
+    stacked = (head_w + window_w(windows) + meta_w > limit - x0 - PADI
+               and y1 - y0 >= 40)
+    head_y = y0 + 15 if stacked else (y0 + y1) // 2
+    row_y = y1 - 14 if stacked else head_y
+
+    if meta:
+        d.text((limit, head_y), meta, font=f.tiny, fill=MUTED, anchor="rm")
+        if not stacked:
+            limit -= d.textlength(meta, font=f.tiny) + 14
+
+    cx = x0 + PADI
+    d.text((cx, head_y), "耗电量", font=f.label, fill=INK2, anchor="lm")
+    cx += d.textlength("耗电量", font=f.label) + 12
+
+    dot(d, cx, head_y - 4, C_PWR, 4)
+    cx += 13
+    d.text((cx, head_y), watts, font=f.value_xs, fill=INK, anchor="lm")
+    cx += d.textlength(watts, font=f.value_xs) + 3
+    d.text((cx, head_y + 3), "W", font=f.tiny, fill=MUTED, anchor="lm")
+    cx += 22
+
+    if stacked:
+        cx = x0 + PADI
+    for name, value in windows:
+        d.text((cx, row_y + 1), name, font=f.tiny, fill=MUTED, anchor="lm")
+        cx += d.textlength(name, font=f.tiny) + 5
+        d.text((cx, row_y), value, font=f.row, fill=INK, anchor="lm")
+        cx += d.textlength(value, font=f.row) + 16
+
+
+# --- disk -----------------------------------------------------------------
+
+def _disk_temp_color(dk: dict):
+    """Status hue for a drive temperature, against thresholds it can survive.
+
+    A drive's own declared warning is the point at which it starts throttling —
+    82°C on this machine — so honouring it literally would leave the dot green
+    at 75°C, which is not a calm number for an NVMe. The declared values are
+    used as a ceiling and capped at temperatures that mean something to a person.
+    """
+    temp = dk.get("temp_c")
+    if temp is None:
+        return MUTED
+    crit = min(dk.get("temp_crit") or 85.0, 75.0)
+    warn = min(dk.get("temp_warn") or 80.0, 65.0)
+    if temp >= crit:
+        return S_CRIT
+    if temp >= warn:
+        return S_WARN
+    return S_GOOD
+
+
+def _disk_tile(img, d, f, s, box) -> None:
+    """System drive: how hot it is, how hard it is working, how full it is."""
+    x0, y0, x1, y1 = box
+    ix0, ix1 = x0 + PADI, x1 - PADI
+    dk = s.get("disk") or {}
+    letter = dk.get("letter") or "C"
+
+    used_pct = dk.get("used_pct")
+    meta = f"{used_pct:.0f}% 已用" if used_pct is not None else ""
+    tile(d, box, f, f"磁盘 {letter}:", meta)
+
+    if not dk.get("ok"):
+        d.text((ix0, y0 + TITLE_H + 4), dk.get("err") or "—", font=f.sub,
+               fill=MUTED)
+        return
+
+    y = y0 + TITLE_H
+    temp = dk.get("temp_c")
+    dot(d, ix0, y + 8, _disk_temp_color(dk), 4)
+    if temp is None:
+        # Not every drive has a sensor, and a volume spanning two disks has no
+        # single temperature; say so rather than showing a hopeful dash.
+        d.text((ix0 + 14, y + 4), "无温度读数", font=f.tiny, fill=MUTED)
+    else:
+        d.text((ix0 + 14, y), f"{temp:.0f}°C", font=f.value_xs, fill=INK)
+    if dk.get("total_gb"):
+        d.text((ix1, y + 5), f"{dk['used_gb']:.0f} / {dk['total_gb']:.0f} GB",
+               font=f.tiny, fill=MUTED, anchor="ra")
+
+    y += 28
+    # Read and write share the drive's one hue: they are the same device, told
+    # apart by the arrow, and a second hue here would collide with the network
+    # tile's up/down pair sitting a few rows away.
+    read = f"↓ {fmt_rate(float(dk.get('read_bps') or 0.0))}"
+    write = f"↑ {fmt_rate(float(dk.get('write_bps') or 0.0))}"
+    d.text((ix0, y), read, font=f.row, fill=INK)
+    if ix1 - ix0 - d.textlength(read, font=f.row) > d.textlength(write, font=f.row) + 8:
+        d.text((ix1, y), write, font=f.row, fill=INK, anchor="ra")
+    else:
+        y += 16
+        d.text((ix0, y), write, font=f.row, fill=INK)
+
+    y += 18
+    if used_pct is not None and y1 - y >= 6:
+        meter(d, (ix0, y, ix1, y + min(7, y1 - y)), used_pct / 100.0, C_DISK)
+
+
+# --- docker ---------------------------------------------------------------
+
+def _docker_state(state: str):
+    """Container state as a status hue — running, paused/created, or stopped."""
+    if state == "running":
+        return S_GOOD
+    if state in ("exited", "dead"):
+        return MUTED
+    return S_WARN
+
+
+def _docker_tile(img, d, f, s, box) -> None:
+    x0, y0, x1, y1 = box
+    ix0, ix1 = x0 + PADI, x1 - PADI
+    dk = s.get("docker") or {}
+    rows = dk.get("containers") or []
+
+    meta = f"{dk.get('running', 0)}/{dk.get('total', 0)} 运行中" if dk.get("ok") else ""
+    tile(d, box, f, "Docker 容器", meta)
+
+    if not dk.get("ok"):
+        d.text((ix0, y0 + TITLE_H + 4), dk.get("err") or "—", font=f.sub,
+               fill=MUTED)
+        return
+    if not rows:
+        d.text((ix0, y0 + TITLE_H + 4), "没有容器", font=f.sub, fill=MUTED)
+        return
+
+    top = y0 + TITLE_H
+    row_h = 22
+    fits = max(1, int((y1 - 6 - top) // row_h))
+    for i, c in enumerate(rows[:fits]):
+        ry = top + i * row_h
+        # The mark is the container's state, which is exactly what status hues
+        # are for; the numbers beside it stay in ink.
+        dot(d, ix0, ry + row_h / 2 - 3, _docker_state(c.get("state") or ""), 3)
+
+        cpu, mem = c.get("cpu"), c.get("mem_mb")
+        right = ""
+        if cpu is not None:
+            right = _as_pct(cpu)
+        if mem is not None:
+            right = (right + "  " if right else "") + _as_mb(mem)
+        if not right:
+            right = ellipsize(d, c.get("status") or "", f.tiny, (x1 - x0) * 0.4)
+        rw = d.textlength(right, font=f.row if cpu is not None else f.tiny)
+        d.text((ix1, ry + row_h / 2), right,
+               font=f.row if cpu is not None else f.tiny,
+               fill=INK if cpu is not None else MUTED, anchor="rm")
+        d.text((ix0 + 12, ry + row_h / 2),
+               ellipsize(d, c.get("name") or "?", f.meta, ix1 - ix0 - rw - 24),
+               font=f.meta, fill=INK2, anchor="lm")
+
+    hidden = len(rows) - fits
+    if hidden > 0:
+        d.text((ix1, y1 - 14), f"还有 {hidden} 个", font=f.tiny, fill=MUTED,
+               anchor="ra")
+
+
+def _docker_slim(img, d, f, s, box) -> None:
+    """One line for the machines that have no Docker — which is most of them."""
+    x0, y0, x1, y1 = box
+    dk = s.get("docker") or {}
+    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    cy = (y0 + y1) // 2
+    d.text((x0 + PADI, cy), f"Docker {dk.get('err') or '—'}", font=f.meta,
+           fill=MUTED, anchor="lm")
 
 
 # --- network --------------------------------------------------------------
@@ -705,6 +1196,25 @@ def _battery(d, f, x, y, batt: dict) -> float:
     return bw + 7 + d.textlength(text, font=f.meta)
 
 
+def _weather_chip(d, f, s, right, y, room: float) -> float:
+    """Condition and temperature now, beside the clock. Returns the width used.
+
+    Page 1 has no spare row for the forecast strip any more, and the header does
+    have spare width — but only while the device list is short, so this yields
+    the moment the chips need the space. The full forecast is on page 2.
+    """
+    w = s.get("weather") or {}
+    now = w.get("now") or {}
+    if not w.get("ok") or now.get("temp") is None:
+        return 0.0
+    text = f"{now.get('text') or ''} {now['temp']:.0f}°".strip()
+    width = d.textlength(text, font=f.meta)
+    if width > room:
+        return 0.0
+    d.text((right, y), text, font=f.meta, fill=INK2, anchor="ra")
+    return width
+
+
 def _header(d, f, s, w, devices=(), dev_idx: int = 0, battery=None) -> None:
     right = w - PAD - 2
     tw = d.textlength(s["time"], font=f.label)
@@ -720,6 +1230,12 @@ def _header(d, f, s, w, devices=(), dev_idx: int = 0, battery=None) -> None:
         right -= 14
 
     left = PAD + 2
+    # The chips get first claim on what is left: the device you are looking at
+    # has to stay legible, and the weather never earns a truncated name.
+    ww = _weather_chip(d, f, s, right, 5, max(0.0, right - left - 150))
+    if ww:
+        right -= ww + 12
+
     avail = right - left
     if devices:
         _device_strip(d, f, left, 5, avail, devices, dev_idx)
@@ -733,24 +1249,43 @@ def _header(d, f, s, w, devices=(), dev_idx: int = 0, battery=None) -> None:
 # anything adaptive: each row's height is chosen to be the least that keeps its
 # tile legible at arm's length on a 3.5" panel.
 
+def _mem_meta(s: dict) -> str:
+    """Whole-machine memory, carried by the top-three tile's own title row.
+
+    It used to have a bar of its own at the foot of the page. Two readings about
+    memory a screen apart was the worse arrangement, and folding the total into
+    the header of the table that breaks it down freed a whole row.
+    """
+    m = s.get("mem") or {}
+    if not m.get("total_gb"):
+        return ""
+    return f"{m['used_gb']:.1f} / {m['total_gb']:.0f} GB · {m['percent']:.0f}%"
+
+
 def _draw_landscape(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
     w = LANDSCAPE[0]
     x0, x1 = PAD, w - PAD
-    half = (x1 - x0 - GAP) // 2
-    mx = x0 + half + GAP
+    third = (x1 - x0 - 2 * GAP) // 3
+    ax, bx = x0 + third + GAP, x0 + 2 * (third + GAP)
     _header(d, f, s, w, devices, dev_idx, battery)
 
     _cpu_tile(img, d, f, s, (x0, 28, x1, 140))
-    _fps_tile(img, d, f, s, (x0, 146, x0 + half, 236))
-    _gpu_tile(img, d, f, s, (mx, 146, x1, 236))
-    _proc_tile(img, d, f, (x0, 242, x0 + half, 318), "CPU 占用前三",
+    # FPS and GPU gave up a row's worth of height between them to make room for
+    # the three tiles below. FPS loses its trend line at this size, which is the
+    # right thing to lose: it is blank whenever no game is running, which is most
+    # of the time, while every tile it paid for is always showing something.
+    _fps_tile(img, d, f, s, (x0, 146, x0 + third, 222))
+    _gpu_tile(img, d, f, s, (ax, 146, ax + third, 222))
+    _proc_tile(img, d, f, (bx, 146, x1, 222), "内存前三",
+               s.get("mem_top", []), C_MEM, "暂无", _as_mb, _mem_meta(s))
+    _proc_tile(img, d, f, (x0, 228, x0 + third, 304), "CPU 前三",
                s.get("top", []), C_CPU, "暂无")
-    _proc_tile(img, d, f, (mx, 242, x1, 318), "GPU 占用前三",
+    _proc_tile(img, d, f, (ax, 228, ax + third, 304), "GPU 前三",
                s.get("gpu_top", []), C_GPU, "暂无")
-    _net_tile(img, d, f, s, (x0, 324, x1, 392))
-    _ai_tile(img, d, f, s, (x0, 398, x1, 442))
-    _mem_slim(img, d, f, s, (x0, 448, x0 + half, 472))
-    _weather_slim(img, d, f, s, (mx, 448, x1, 472))
+    _disk_tile(img, d, f, s, (bx, 228, x1, 304))
+    _net_tile(img, d, f, s, (x0, 310, x1, 378))
+    _ai_tile(img, d, f, s, (x0, 384, x1, 428))
+    _power_strip(img, d, f, s, (x0, 434, x1, 472))
 
 
 def _draw_portrait(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
@@ -761,22 +1296,111 @@ def _draw_portrait(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
     _header(d, f, s, w, devices, dev_idx, battery)
 
     _cpu_tile(img, d, f, s, (x0, 28, x1, 140))
-    # Portrait is too narrow for the FPS trend line, so this tile is only as tall
-    # as its headline needs; the height goes to GPU, which can show its VRAM.
-    _fps_tile(img, d, f, s, (x0, 146, x1, 218))
-    _gpu_tile(img, d, f, s, (x0, 224, x1, 324))
-    _proc_tile(img, d, f, (x0, 330, x0 + half, 416), "CPU 前三",
+    # Standing these two side by side is what pays for the disk and memory
+    # tiles below; at this height FPS still keeps its trend line and GPU still
+    # keeps its VRAM bar, so nothing is actually lost to the move.
+    _fps_tile(img, d, f, s, (x0, 146, x0 + half, 234))
+    _gpu_tile(img, d, f, s, (mx, 146, x1, 234))
+    _proc_tile(img, d, f, (x0, 240, x0 + half, 328), "CPU 前三",
                s.get("top", []), C_CPU, "暂无")
-    _proc_tile(img, d, f, (mx, 330, x1, 416), "GPU 前三",
+    _proc_tile(img, d, f, (mx, 240, x1, 328), "GPU 前三",
                s.get("gpu_top", []), C_GPU, "暂无")
-    _net_tile(img, d, f, s, (x0, 422, x1, 496))
+    _proc_tile(img, d, f, (x0, 334, x0 + half, 422), "内存前三",
+               s.get("mem_top", []), C_MEM, "暂无", _as_mb, _mem_meta(s))
+    _disk_tile(img, d, f, s, (mx, 334, x1, 422))
+    _net_tile(img, d, f, s, (x0, 428, x1, 504))
     # Portrait has the height landscape does not, so the quota tile takes a
-    # title and two rows of gauges here, and weather gets a whole row rather
-    # than half of one — which is what lets it show all five readings.
-    _ai_tile(img, d, f, s, (x0, 502, x1, 572))
-    _mem_slim(img, d, f, s, (x0, 578, x1, 602))
-    _weather_slim(img, d, f, s, (x0, 608, x1, 632))
+    # title bar here and puts the reset countdowns on a line of their own.
+    _ai_tile(img, d, f, s, (x0, 510, x1, 580))
+    _power_strip(img, d, f, s, (x0, 586, x1, 632))
 
+
+# --- page 2: detail -------------------------------------------------------
+# Docker is the reason this page exists but most machines have none, and a
+# half-screen panel saying "未安装 Docker" would be the worst use of the space on
+# the whole dashboard. So there are two grids rather than one: the container list
+# takes the top when there is something to list, and shrinks to a single line at
+# the bottom when there is not, with the height going to the advice paragraph —
+# which is the tile that can always use more.
+
+SLIM_H = 24
+DOCK_ROW_H = 22
+
+
+def _has_docker(s: dict) -> bool:
+    return bool((s.get("docker") or {}).get("ok"))
+
+
+def _docker_height(s: dict, cap: int) -> int:
+    """Just enough rows for the containers there are, up to what the page has.
+
+    Page 1's grid is fixed because every tile on it always has something to show.
+    Here the container count is whatever this machine happens to run, and a tile
+    sized for ten when there are three would take the space out of the advice
+    paragraph for nothing.
+    """
+    rows = len((s.get("docker") or {}).get("containers") or [])
+    return max(64, min(cap, TITLE_H + DOCK_ROW_H * max(rows, 1) + 8))
+
+
+def _draw_detail(img, d, f, s, size, dock_cap: int, devices, dev_idx,
+                 battery) -> None:
+    """Page 2 in either orientation — the same stack, only the width differs.
+
+    Unlike page 1 there is no grid here, because every tile on this page varies:
+    the container list is however many containers this machine runs, and the
+    advice is one line or a paragraph. Both are sized to their content and the
+    leftover is simply left blank, which reads as "nothing more to show" rather
+    than as a panel that failed to load.
+    """
+    w, h = size
+    x0, x1 = PAD, w - PAD
+    bottom = h - PAD
+    _header(d, f, s, w, devices, dev_idx, battery)
+
+    # The forecast strip lives here now that page 1 only has room for the
+    # current conditions in its header.
+    _weather_slim(img, d, f, s, (x0, bottom - SLIM_H, x1, bottom))
+    bottom -= SLIM_H + GAP
+
+    y = 28
+    if _has_docker(s):
+        h = _docker_height(s, dock_cap)
+        _docker_tile(img, d, f, s, (x0, y, x1, y + h))
+        y += h + GAP
+    else:
+        # No containers to list, so the answer is one line at the foot of the
+        # page and the height goes to the tile that can always use more.
+        _docker_slim(img, d, f, s, (x0, bottom - SLIM_H, x1, bottom))
+        bottom -= SLIM_H + GAP
+
+    advice_h = _advice_height(d, f, s, x1 - x0, bottom - y)
+    _advice_tile(img, d, f, s, (x0, y, x1, y + advice_h))
+    y += advice_h + GAP
+
+    # The windows page 1 has no room for land here, but only if there is room
+    # left after the two tiles this page is actually about. A machine running
+    # twenty containers gets the container list; a machine running none gets
+    # the quota breakdown instead of half a screen of background.
+    detail_h = _ai_detail_height(s, bottom - y)
+    if detail_h >= TITLE_H + 3 * AI_ROW_H:
+        _ai_detail_tile(img, d, f, s, (x0, y, x1, y + detail_h))
+
+
+def _draw_landscape_detail(img, d, f, s, devices=(), dev_idx=0,
+                           battery=None) -> None:
+    _draw_detail(img, d, f, s, LANDSCAPE, 300, devices, dev_idx, battery)
+
+
+def _draw_portrait_detail(img, d, f, s, devices=(), dev_idx=0,
+                          battery=None) -> None:
+    _draw_detail(img, d, f, s, PORTRAIT, 420, devices, dev_idx, battery)
+
+
+# Page order is the order UP and DOWN walk through on the handheld.
+_PAGES = ((_draw_landscape, _draw_portrait),
+          (_draw_landscape_detail, _draw_portrait_detail))
+PAGE_COUNT = len(_PAGES)
 
 # orient counts quarter-turns clockwise as the user rotates the handheld, so the
 # content is turned the opposite way to stay upright in their hands.
@@ -784,22 +1408,24 @@ _CONTENT_ROTATION = {0: 0, 1: 270, 2: 180, 3: 90}
 
 
 def draw_layout(snapshot: dict, fonts: Fonts, portrait: bool = False,
-                devices=(), dev_idx: int = 0, battery=None) -> Image.Image:
+                devices=(), dev_idx: int = 0, battery=None,
+                page: int = 0) -> Image.Image:
     """The layout at its natural size and upright — for humans looking at a screen."""
     img = Image.new("RGB", PORTRAIT if portrait else LANDSCAPE, PLANE)
     d = ImageDraw.Draw(img)
-    draw = _draw_portrait if portrait else _draw_landscape
+    draw = _PAGES[page % PAGE_COUNT][1 if portrait else 0]
     draw(img, d, fonts, snapshot, devices, dev_idx, battery)
     return img
 
 
 def render(snapshot: dict, fonts: Fonts, orient: int = 0,
            panel_flip: bool = True, devices=(), dev_idx: int = 0,
-           battery=None) -> Image.Image:
+           battery=None, page: int = 0) -> Image.Image:
     """The frame as the handheld should receive it, mapped onto the panel."""
     orient %= 4
     img = draw_layout(snapshot, fonts, portrait=orient in (1, 3),
-                      devices=devices, dev_idx=dev_idx, battery=battery)
+                      devices=devices, dev_idx=dev_idx, battery=battery,
+                      page=page)
 
     rotation = _CONTENT_ROTATION[orient]
     if rotation:

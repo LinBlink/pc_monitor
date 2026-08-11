@@ -21,11 +21,16 @@ from dataclasses import dataclass, field
 
 import psutil
 
+import advice
 import aiquota
+import diskstat
+import dockerstat
 import paths
 import perfcounters
+import power
 import rtss
 import sensors
+import tts
 import weather
 
 HISTORY = 72  # samples kept per sparkline
@@ -125,11 +130,15 @@ class GpuPoller(threading.Thread):
 _PROC_PATHS = {
     "cpu": r"\Process(*)\% Processor Time",
     "gpu": r"\GPU Engine(*)\Utilization Percentage",
+    # Private working set, not the plain one: shared pages (every process maps
+    # the same system DLLs) would otherwise be counted once per process and the
+    # column would add up to several times the RAM in the machine.
+    "mem": r"\Process(*)\Working Set - Private",
 }
 
 
 class ProcPoller(threading.Thread):
-    """Top CPU and GPU consumers, sampled through PDH directly.
+    """Top CPU, GPU and memory consumers, sampled through PDH directly.
 
     The previous version spawned a PowerShell child that called Get-Counter
     twice per cycle. Get-Counter wraps every one of ~500 GPU-engine instances
@@ -147,6 +156,10 @@ class ProcPoller(threading.Thread):
     have to be summed by PID. The result matches Task Manager's GPU column
     and, unlike ``nvidia-smi pmon``, counts graphics work, not just compute.
 
+    Memory comes from ``\\Process(*)\\Working Set - Private`` and is aggregated
+    the same way as CPU, so a browser's dozen renderers are reported as one
+    entry rather than filling the table with copies of the same name.
+
     English counter paths work on every locale via ``PdhAddEnglishCounterW``,
     so no registry name translation is needed.
     """
@@ -157,6 +170,7 @@ class ProcPoller(threading.Thread):
         self.count = count
         self.cpu_top: list[tuple[str, float]] = []
         self.gpu_top: list[tuple[str, float]] = []
+        self.mem_top: list[tuple[str, float]] = []  # (name, MB)
         self.ok = False
         self._stop = threading.Event()
         self._ncpu = max(1, psutil.cpu_count(logical=True) or 1)
@@ -181,16 +195,33 @@ class ProcPoller(threading.Thread):
         finally:
             query.close()
 
-    def _publish(self, data: dict[str, list[tuple[str, float]]]) -> None:
-        cpu_by_name: dict[str, float] = {}
-        for instance, value in data.get("cpu", []):
+    @staticmethod
+    def _by_name(rows) -> dict[str, float]:
+        """Sum ``\\Process(*)`` instances back into one entry per executable.
+
+        Instances are named after the process with a ``#N`` suffix for
+        duplicates, so a browser's renderers arrive as ``chrome``, ``chrome#1``,
+        ``chrome#2`` and are only meaningful added together.
+        """
+        totals: dict[str, float] = {}
+        for instance, value in rows:
             if instance in ("_Total", "_total", "Idle", "idle"):
                 continue
             base = instance.rsplit("#", 1)[0] if "#" in instance else instance
-            cpu_by_name[base] = cpu_by_name.get(base, 0.0) + value
+            totals[base] = totals.get(base, 0.0) + value
+        return totals
+
+    def _publish(self, data: dict[str, list[tuple[str, float]]]) -> None:
+        cpu_by_name = self._by_name(data.get("cpu", []))
         self.cpu_top = [(name, min(value / self._ncpu, 100.0))
                         for name, value in
                         sorted(cpu_by_name.items(),
+                               key=lambda r: r[1], reverse=True)[:self.count]]
+
+        mem_by_name = self._by_name(data.get("mem", []))
+        self.mem_top = [(name, value / 1024.0 ** 2)
+                        for name, value in
+                        sorted(mem_by_name.items(),
                                key=lambda r: r[1], reverse=True)[:self.count]]
 
         gpu_by_pid: dict[int, float] = {}
@@ -279,6 +310,8 @@ class DailyTraffic:
 
 
 TRAFFIC_PATH = os.path.join(paths.base_dir(), "traffic.json")
+POWER_PATH = os.path.join(paths.base_dir(), "power.json")
+HISTORY_PATH = os.path.join(paths.base_dir(), "history.jsonl")
 
 
 class Collector:
@@ -314,14 +347,35 @@ class Collector:
         self.gpu.start()
         self.procs = ProcPoller()
         self.procs.start()
+        # Shells out to the docker CLI, which is far too slow to do inline.
+        self.docker = dockerstat.DockerPoller()
+        self.docker.start()
 
         # Both talk to the internet, so like the GPU and process pollers they
         # own a thread and the frame loop only ever reads their last result.
         cfg = settings.snapshot if settings else (lambda: {})
+        # The drive letter is fixed for the life of the process: the counter path
+        # and the device handle are both opened once, so changing it takes a
+        # restart — which the settings page says.
+        self.disk = diskstat.DiskPoller((cfg() or {}).get("disk_letter") or "C")
+        self.disk.start()
+        # Reads the same sample the renderer gets, so it is fed at the end of
+        # sample() rather than owning a thread of its own.
+        self.power = power.PowerLog(POWER_PATH, cfg)
         self.ai = aiquota.AiPoller(cfg)
         self.ai.start()
         self.weather = weather.WeatherPoller(cfg)
         self.weather.start()
+
+        # The advisor reads back the snapshot this collector just produced, so
+        # it is handed a getter rather than being wired into sample() itself.
+        self._cfg = cfg
+        self._last: dict = {}
+        self.audio: dict = {"id": 0, "path": None, "err": None}
+        self.history = advice.History(HISTORY_PATH)
+        self.advisor = advice.Advisor(self.history, cfg, lambda: self._last,
+                                      self._synthesize)
+        self.advisor.start()
 
         self._rtss_checked = 0.0
         self._rtss_up = False
@@ -333,8 +387,18 @@ class Collector:
     def close(self) -> None:
         self.gpu.stop()
         self.procs.stop()
+        self.docker.stop()
+        self.disk.stop()
         self.ai.stop()
         self.weather.stop()
+        self.advisor.stop()
+
+    def _synthesize(self, text: str, advice_id: int) -> None:
+        """Called by the advisor when something is worth saying out loud."""
+        path, err = tts.synthesize(text, self._cfg() or {}, paths.base_dir())
+        self.audio = {"id": advice_id, "path": path, "err": err or None}
+        if err:
+            print(f"[tts] {err}", flush=True)
 
     @staticmethod
     def _cpu_name() -> str:
@@ -416,7 +480,7 @@ class Collector:
         fps = rtss.read_fps() if self._rtss_up else None
         self.fps_hist.push(fps.fps if fps else 0.0)
 
-        return {
+        out = {
             "host": self.host,
             "time": time.strftime("%H:%M:%S"),
             "cpu": {
@@ -469,9 +533,20 @@ class Collector:
             },
             "top": list(self.procs.cpu_top),
             "gpu_top": list(self.procs.gpu_top),
+            "mem_top": list(self.procs.mem_top),
             "ai": self.ai.data,
             "weather": self.weather.data,
+            "docker": self.docker.data,
+            "disk": self.disk.data,
         }
+        # Energy is integrated from the reading that was just taken, so it can
+        # only be folded in once the rest of the snapshot exists.
+        self.power.add(out)
+        out["power"] = self.power.data()
+        out["advice"] = self.advisor.data
+        self._last = out
+        self.history.maybe_add(out)
+        return out
 
 
 if __name__ == "__main__":
