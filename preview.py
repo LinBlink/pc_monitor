@@ -123,16 +123,19 @@ if __name__ == "__main__":
     fonts = render.Fonts()
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     # Page 1 in both orientations for the two states that stress it, then page 2
-    # with and without Docker — the two grids it switches between.
-    shots = [(f"{tag}", snapshot(flag), 0) for tag, flag in
+    # with and without Docker — the two grids it switches between. The last two
+    # are the same page 1 in the other theme: what changes between themes is
+    # colour only, so one state is enough to see all of it.
+    shots = [(f"{tag}", snapshot(flag), 0, "dark") for tag, flag in
              (("game", True), ("idle", False))]
-    shots += [("docker", snapshot(True, docker=True), 1),
-              ("nodocker", snapshot(True, docker=False), 1)]
-    for tag, snap, page in shots:
+    shots += [("docker", snapshot(True, docker=True), 1, "dark"),
+              ("nodocker", snapshot(True, docker=False), 1, "dark"),
+              ("term", snapshot(True), 0, "term")]
+    for tag, snap, page, theme in shots:
         for portrait, oname in ((False, "landscape"), (True, "portrait")):
             img = render.draw_layout(snap, fonts, portrait=portrait,
                                      devices=DEVICES, dev_idx=0,
-                                     battery=BATTERY, page=page)
+                                     battery=BATTERY, page=page, theme=theme)
             path = f"{out}/preview_{oname}_{tag}.png"
             img.save(path)
             print("wrote", path, img.size)

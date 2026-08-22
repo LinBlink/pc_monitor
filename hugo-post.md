@@ -135,7 +135,6 @@ PC 端 `config.json`：
 | `weather_city` / `weather_lat` / `weather_lon` | 空 | 天气定位，三选一 |
 | `deepseek_key` | 空 | DeepSeek 额度查询的 API key |
 | `minimax_key` / `minimax_region` | 空 / `cn` | MiniMax 额度查询的 API key 与地域 |
-| `aimon_port` | 9000 | Claude 额度走本地 aimon 服务的端口 |
 
 ## 天气小组件
 
@@ -153,7 +152,7 @@ PC 端 `config.json`：
 
 `aiquota.py` 后台轮询三家 API 的额度，画成用量条：
 
-- **Claude**：5 小时 / 7 天用量条，带 Opus 开关和 `extra` 计费额度（走 `aimon` 本地服务）；
+- **Claude**：5 小时 / 7 天用量条，带 Opus 开关和 `extra` 计费额度（直接问 Anthropic）；
 - **DeepSeek**：账户余额；
 - **MiniMax**：按**模型组**分（"general" 文本、视频等），仪表盘取文本额度，`/ai` 页面列全部并带各自的 5 小时 / 7 天用量和重置时间。
 

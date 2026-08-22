@@ -19,10 +19,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-import psutil
-
 import advice
 import aiquota
+import alerts
 import diskstat
 import dockerstat
 import paths
@@ -30,19 +29,28 @@ import perfcounters
 import power
 import rtss
 import sensors
-import tts
+import sysinfo
 import weather
 
 HISTORY = 72  # samples kept per sparkline
+
+IS_WINDOWS = os.name == "nt"
 
 _VIRTUAL_NIC_HINTS = ("loopback", "vethernet", "vmware", "virtualbox", "hyper-v",
                       "bluetooth", "teredo", "isatap", "tap-", "wsl", "docker",
                       "todesk", "tailscale", "zerotier")
 
+# Linux interface names are short and mean nothing to a substring search, so they
+# are matched as prefixes instead: "lo", "virbr0", "veth3f2a", "br-1a2b", "tun0".
+_VIRTUAL_NIC_PREFIXES = ("lo", "veth", "virbr", "br-", "docker", "tun", "tap",
+                         "tailscale", "zt", "wg")
+
 
 def _looks_virtual(name: str) -> bool:
     low = name.lower()
-    return any(h in low for h in _VIRTUAL_NIC_HINTS)
+    if any(h in low for h in _VIRTUAL_NIC_HINTS):
+        return True
+    return not IS_WINDOWS and low.startswith(_VIRTUAL_NIC_PREFIXES)
 
 
 @dataclass
@@ -162,6 +170,10 @@ class ProcPoller(threading.Thread):
 
     English counter paths work on every locale via ``PdhAddEnglishCounterW``,
     so no registry name translation is needed.
+
+    On Linux none of that applies: ``/proc`` is a handful of small text files, so
+    the plain process walk that was too slow on Windows costs a few milliseconds
+    and is what :meth:`_run_linux` does. Only the GPU still needs a subprocess.
     """
 
     def __init__(self, interval_s: float = 2.0, count: int = 3):
@@ -173,12 +185,18 @@ class ProcPoller(threading.Thread):
         self.mem_top: list[tuple[str, float]] = []  # (name, MB)
         self.ok = False
         self._stop = threading.Event()
-        self._ncpu = max(1, psutil.cpu_count(logical=True) or 1)
+        self._ncpu = max(1, sysinfo.cpu_count(logical=True) or 1)
+        self._pmon_ok = True
+        self._pmon_retry = 0.0
 
     def stop(self) -> None:
         self._stop.set()
 
     def run(self) -> None:
+        if not IS_WINDOWS:
+            self._run_linux()
+            return
+
         try:
             query = perfcounters.CounterQuery(_PROC_PATHS)
         except perfcounters.PdhError:
@@ -194,6 +212,98 @@ class ProcPoller(threading.Thread):
                     self._stop.wait(wait)
         finally:
             query.close()
+
+    def _run_linux(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            self._sample_linux()
+            wait = self.interval_s - (time.monotonic() - t0)
+            if wait > 0:
+                self._stop.wait(wait)
+
+    def _sample_linux(self) -> None:
+        """Top CPU and memory from ``/proc``, top GPU from ``nvidia-smi pmon``.
+
+        ``process_iter`` keeps its own cache of Process objects between calls,
+        which is what makes ``cpu_percent()`` a delta over our interval rather
+        than an average since boot. The first pass therefore reports zeros.
+
+        Memory is RSS: the private working set (USS) would mean reading ``smaps``
+        for every process, which is a hundred times dearer and needs privileges
+        we do not ask for.
+        """
+        cpu_by_name: dict[str, float] = {}
+        mem_by_name: dict[str, float] = {}
+        # ad_value keeps a process we may not inspect — another user's, or one
+        # in a container — from aborting the whole walk; it just contributes
+        # nothing.
+        for proc in sysinfo.process_iter(["name", "cpu_percent", "memory_info"],
+                                        ad_value=None):
+            info = proc.info
+            name = info.get("name") or ""
+            if not name:
+                continue  # a kernel thread, or it exited mid-walk
+            cpu_by_name[name] = cpu_by_name.get(name, 0.0) + (
+                info.get("cpu_percent") or 0.0)
+            mem = info.get("memory_info")
+            if mem:
+                mem_by_name[name] = mem_by_name.get(name, 0.0) + mem.rss
+
+        self.cpu_top = [(name, min(value / self._ncpu, 100.0))
+                        for name, value in
+                        sorted(cpu_by_name.items(),
+                               key=lambda r: r[1], reverse=True)[:self.count]]
+        self.mem_top = [(name, value / 1024.0 ** 2)
+                        for name, value in
+                        sorted(mem_by_name.items(),
+                               key=lambda r: r[1], reverse=True)[:self.count]]
+        self.gpu_top = self._gpu_top_linux()
+        self.ok = True
+
+    def _gpu_top_linux(self) -> list[tuple[str, float]]:
+        """Per-process GPU utilisation from ``nvidia-smi pmon``.
+
+        There is no ``/proc`` answer to this question, and the compute-apps query
+        only reports memory, so a subprocess it is. ``pmon -c 1`` samples for a
+        second before printing, which is why this is the only part of the Linux
+        walk that costs anything — and why a machine without an NVIDIA GPU stops
+        being asked after the first failure, bar an occasional re-check.
+        """
+        now = time.monotonic()
+        if not self._pmon_ok and now < self._pmon_retry:
+            return []
+        try:
+            proc = subprocess.run(
+                ["nvidia-smi", "pmon", "-c", "1", "-s", "u"],
+                capture_output=True, text=True, timeout=15.0)
+            out = proc.stdout if proc.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        if not out.strip():
+            self._pmon_ok = False
+            self._pmon_retry = now + 300.0
+            return []
+        self._pmon_ok = True
+
+        by_name: dict[str, float] = {}
+        for line in out.splitlines():
+            if line.startswith("#"):
+                continue
+            fields = line.split()
+            # gpu, pid, type, sm, mem, ... , command — newer drivers add columns
+            # in the middle, so the ends are what can be indexed safely.
+            if len(fields) < 5 or not fields[1].isdigit():
+                continue
+            try:
+                sm = float(fields[3])
+            except ValueError:
+                continue  # "-" for a process using memory but no engine
+            name = fields[-1]
+            by_name[name] = by_name.get(name, 0.0) + sm
+        return [(name, min(value, 100.0))
+                for name, value in sorted(by_name.items(),
+                                          key=lambda r: r[1],
+                                          reverse=True)[:self.count]]
 
     @staticmethod
     def _by_name(rows) -> dict[str, float]:
@@ -235,7 +345,7 @@ class ProcPoller(threading.Thread):
                 continue
             gpu_by_pid[pid] = gpu_by_pid.get(pid, 0.0) + value
 
-        # Cap the psutil lookups so a batch of exited processes can't drag us
+        # Cap the per-PID lookups so a batch of exited processes can't drag us
         # through every PID in the list.
         rows: list[tuple[str, float]] = []
         candidates = sorted(gpu_by_pid.items(),
@@ -244,8 +354,8 @@ class ProcPoller(threading.Thread):
             if len(rows) >= self.count:
                 break
             try:
-                name = psutil.Process(pid).name()
-            except (psutil.Error, ValueError):
+                name = sysinfo.Process(pid).name()
+            except (sysinfo.Error, ValueError):
                 continue  # exited between the counter read and now
             if name.lower().endswith(".exe"):
                 name = name[:-4]
@@ -309,9 +419,9 @@ class DailyTraffic:
             self._save()
 
 
-TRAFFIC_PATH = os.path.join(paths.base_dir(), "traffic.json")
-POWER_PATH = os.path.join(paths.base_dir(), "power.json")
-HISTORY_PATH = os.path.join(paths.base_dir(), "history.jsonl")
+TRAFFIC_PATH = os.path.join(paths.state_dir(), "traffic.json")
+POWER_PATH = os.path.join(paths.state_dir(), "power.json")
+HISTORY_PATH = os.path.join(paths.state_dir(), "history.jsonl")
 
 
 class Collector:
@@ -325,7 +435,7 @@ class Collector:
     def __init__(self, settings=None):
         self.host = socket.gethostname()
         self.cpu_name = self._cpu_name()
-        self.cpu_cores = psutil.cpu_count(logical=True) or 1
+        self.cpu_cores = sysinfo.cpu_count(logical=True) or 1
 
         self.cpu_hist = Ring()
         self.gpu_hist = Ring()
@@ -340,8 +450,8 @@ class Collector:
 
         self.traffic = DailyTraffic(TRAFFIC_PATH)
 
-        psutil.cpu_percent(None)  # prime the delta
-        psutil.cpu_percent(None, percpu=True)  # percpu keeps its own last-values
+        sysinfo.cpu_percent(None)  # prime the delta
+        sysinfo.cpu_percent(None, percpu=True)  # percpu keeps its own last-values
 
         self.gpu = GpuPoller()
         self.gpu.start()
@@ -354,16 +464,21 @@ class Collector:
         # Both talk to the internet, so like the GPU and process pollers they
         # own a thread and the frame loop only ever reads their last result.
         cfg = settings.snapshot if settings else (lambda: {})
-        # The drive letter is fixed for the life of the process: the counter path
-        # and the device handle are both opened once, so changing it takes a
-        # restart — which the settings page says.
-        self.disk = diskstat.DiskPoller((cfg() or {}).get("disk_letter") or "C")
+        # The volume is fixed for the life of the process: the counter path and
+        # the device handle are both opened once, so changing it takes a restart
+        # — which the settings page says. A drive letter on Windows, a mount
+        # point on Linux; the default differs accordingly.
+        self.disk = diskstat.DiskPoller(
+            (cfg() or {}).get("disk_letter") or ("C" if IS_WINDOWS else "/"))
         self.disk.start()
         # Reads the same sample the renderer gets, so it is fed at the end of
         # sample() rather than owning a thread of its own.
         self.power = power.PowerLog(POWER_PATH, cfg)
         self.ai = aiquota.AiPoller(cfg)
         self.ai.start()
+        # Reads the quota the poller above just fetched, so like the energy log
+        # it is driven from sample() rather than owning a thread.
+        self.ai_alert = alerts.QuotaAlert(paths.state_dir(), cfg)
         self.weather = weather.WeatherPoller(cfg)
         self.weather.start()
 
@@ -371,10 +486,8 @@ class Collector:
         # it is handed a getter rather than being wired into sample() itself.
         self._cfg = cfg
         self._last: dict = {}
-        self.audio: dict = {"id": 0, "path": None, "err": None}
         self.history = advice.History(HISTORY_PATH)
-        self.advisor = advice.Advisor(self.history, cfg, lambda: self._last,
-                                      self._synthesize)
+        self.advisor = advice.Advisor(self.history, cfg, lambda: self._last)
         self.advisor.start()
 
         self._rtss_checked = 0.0
@@ -393,30 +506,50 @@ class Collector:
         self.weather.stop()
         self.advisor.stop()
 
-    def _synthesize(self, text: str, advice_id: int) -> None:
-        """Called by the advisor when something is worth saying out loud."""
-        path, err = tts.synthesize(text, self._cfg() or {}, paths.base_dir())
-        self.audio = {"id": advice_id, "path": path, "err": err or None}
-        if err:
-            print(f"[tts] {err}", flush=True)
-
     @staticmethod
     def _cpu_name() -> str:
+        """The marketing name of the CPU — "Ryzen 7 5800X", not "x86_64".
+
+        ``platform.processor()`` is the fallback and a poor one: it returns the
+        architecture on Linux and a family/model string on Windows. Both systems
+        keep the real name somewhere better — the registry, or ``/proc/cpuinfo``.
+        """
         name = platform.processor() or ""
-        try:
-            import winreg
-            with winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
-                name = winreg.QueryValueEx(k, "ProcessorNameString")[0]
-        except OSError:
-            pass
+        if IS_WINDOWS:
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                    name = winreg.QueryValueEx(k, "ProcessorNameString")[0]
+            except OSError:
+                pass
+        else:
+            fields: dict[str, str] = {}
+            try:
+                with open("/proc/cpuinfo", encoding="utf-8",
+                          errors="replace") as fh:
+                    for line in fh:
+                        key, sep, value = line.partition(":")
+                        if sep and value.strip():
+                            fields.setdefault(key.strip().lower(), value.strip())
+            except OSError:
+                pass
+            # x86 says "model name". ARM boards have no such field and say
+            # "Hardware" or "Model" instead — but on x86 "model" is the model
+            # *number*, so a bare number there is not a name and is skipped
+            # rather than shown as the CPU's name.
+            for key in ("model name", "hardware", "model"):
+                value = fields.get(key, "")
+                if value and not value.isdigit():
+                    name = value
+                    break
         return " ".join(name.replace("(R)", "").replace("(TM)", "").split())
 
     @staticmethod
     def _pick_nic() -> str | None:
-        stats = psutil.net_if_stats()
-        counters = psutil.net_io_counters(pernic=True)
+        stats = sysinfo.net_if_stats()
+        counters = sysinfo.net_io_counters(pernic=True)
         best, best_bytes = None, -1
         for name, st in stats.items():
             if not st.isup or _looks_virtual(name):
@@ -431,32 +564,32 @@ class Collector:
 
     def _nic_counters(self):
         if self.nic:
-            c = psutil.net_io_counters(pernic=True).get(self.nic)
+            c = sysinfo.net_io_counters(pernic=True).get(self.nic)
             if c:
                 return c.bytes_recv, c.bytes_sent
-        c = psutil.net_io_counters()
+        c = sysinfo.net_io_counters()
         return c.bytes_recv, c.bytes_sent
 
     def sample(self) -> dict:
         now = time.monotonic()
 
-        cpu = psutil.cpu_percent(None)
+        cpu = sysinfo.cpu_percent(None)
         self.cpu_hist.push(cpu)
-        cores = psutil.cpu_percent(None, percpu=True) or []
+        cores = sysinfo.cpu_percent(None, percpu=True) or []
 
         # Afterburner reads the CPU's own registers, so prefer its clock over
-        # psutil's, which reports the nominal base frequency on Windows.
+        # cpu_freq(), which reports the nominal base frequency on Windows.
         if now - self._sensors_checked > 2.0:
             self._sensors = sensors.read()
             self._sensors_checked = now
         sens = self._sensors
 
-        freq = psutil.cpu_freq()
+        freq = sysinfo.cpu_freq()
         cpu_ghz = (freq.current / 1000.0) if freq and freq.current else 0.0
         if sens and sens.cpu_clock_mhz:
             cpu_ghz = sens.cpu_clock_mhz / 1000.0
 
-        vm = psutil.virtual_memory()
+        vm = sysinfo.virtual_memory()
         self.mem_hist.push(vm.percent)
 
         recv, sent = self._nic_counters()
@@ -480,9 +613,18 @@ class Collector:
         fps = rtss.read_fps() if self._rtss_up else None
         self.fps_hist.push(fps.fps if fps else 0.0)
 
+        cfg = self._cfg() or {}
         out = {
             "host": self.host,
             "time": time.strftime("%H:%M:%S"),
+            # Which OS produced this sample. The web page can be watching another
+            # machine on the LAN, so "what can this host measure" has to travel
+            # with the numbers rather than be read from the browser's own host.
+            "platform": "windows" if IS_WINDOWS else "linux",
+            # Carried in the snapshot rather than passed to the renderer: both
+            # clients draw their own key map from it, and the web page already
+            # receives the snapshot and nothing else.
+            "hints": bool(cfg.get("device_hints", True)),
             "cpu": {
                 "name": self.cpu_name,
                 "percent": cpu,
@@ -544,6 +686,8 @@ class Collector:
         self.power.add(out)
         out["power"] = self.power.data()
         out["advice"] = self.advisor.data
+        self.ai_alert.check(out["ai"])
+        out["ai_alert"] = self.ai_alert.data
         self._last = out
         self.history.maybe_add(out)
         return out

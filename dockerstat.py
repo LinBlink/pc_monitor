@@ -19,6 +19,7 @@ daemon is started later.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -30,10 +31,35 @@ TIMEOUT_S = 12.0
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def _rootless_host() -> str | None:
+    """``DOCKER_HOST`` for a rootless daemon owned by this user, if there is one.
+
+    Rootless Docker puts its socket in the user's runtime directory rather than
+    /var/run, and tells you to export DOCKER_HOST in your shell profile — which a
+    systemd unit never reads. So the socket is looked for directly: if it is
+    there and ours, the CLI is pointed at it.
+
+    Nothing is guessed for *other* users' daemons. /run/user/<uid> is 0700, so a
+    service account cannot reach them however hard it tries, and pretending
+    otherwise would only produce a confusing error.
+    """
+    if os.name == "nt" or os.environ.get("DOCKER_HOST"):
+        return None
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    sock = os.path.join(runtime, "docker.sock")
+    return f"unix://{sock}" if os.path.exists(sock) else None
+
+
+def _env() -> dict | None:
+    host = _rootless_host()
+    return dict(os.environ, DOCKER_HOST=host) if host else None
+
+
 def _run(args: list[str]) -> tuple[bool, str]:
     try:
         proc = subprocess.run(args, capture_output=True, text=True,
-                              timeout=TIMEOUT_S, creationflags=_NO_WINDOW)
+                              timeout=TIMEOUT_S, creationflags=_NO_WINDOW,
+                              env=_env())
     except (OSError, subprocess.SubprocessError):
         return False, ""
     if proc.returncode != 0:
@@ -82,6 +108,26 @@ def _mib(text) -> float | None:
     return None
 
 
+def _why(stderr: str) -> str:
+    """The docker CLI's complaint, as something short enough for a tile.
+
+    Worth the mapping: "服务未运行" sent someone down the wrong path for an hour
+    when the real answer was that the daemon was rootless and belonged to another
+    account. The three cases below need three different actions from the reader,
+    so they get three different sentences.
+    """
+    low = (stderr or "").lower()
+    if not stderr:
+        return "未安装"
+    if "permission denied" in low:
+        return "无权访问 docker.sock"
+    if "cannot connect" in low or "is the docker daemon running" in low:
+        return "服务未运行"
+    # Anything else is rare enough to be worth showing verbatim; the tile
+    # ellipsizes and the web page has room for the whole line.
+    return stderr.splitlines()[0][:60]
+
+
 class DockerPoller(threading.Thread):
     """Container list in ``data``; never raises, never blocks the frame loop."""
 
@@ -101,10 +147,7 @@ class DockerPoller(threading.Thread):
     def _poll(self) -> bool:
         ok, out = _run(["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"])
         if not ok:
-            # Distinguishing these matters: "install Docker" and "start Docker"
-            # are different things to tell someone looking at the screen.
-            err = "未安装" if not out else "服务未运行"
-            self.data = {"ok": False, "err": err, "containers": []}
+            self.data = {"ok": False, "err": _why(out), "containers": []}
             return False
 
         rows = []

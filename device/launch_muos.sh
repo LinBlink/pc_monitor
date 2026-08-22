@@ -9,6 +9,8 @@
 #     LEFT / RIGHT   prev / next discovered PC
 #     UP / DOWN      turn the page (overview / detail)
 #     Y              rotate, 4 positions
+#     X              next colour theme (see JSBTN_THEME - unbound by default,
+#                    because this board's button numbering is not the usual one)
 #     SELECT         quit back to the muOS menu
 #
 # muOS sits between the Miyoo and ROCKNIX ports rather than matching either:
@@ -39,7 +41,6 @@ stopflag=/tmp/pcmon_stop
 sweepflag=/tmp/pcmon_sweep
 pidfile=/tmp/pcmon_player
 targetfile=/tmp/pcmon_target
-audiofile=/tmp/pcmon_advice
 selfpid="$progdir/.pid"
 
 FBDEV=/dev/fb0
@@ -58,6 +59,7 @@ JSDEV=/dev/input/js0
 # button table. Any unmapped press is logged as `btn N (unbound)`, which is how
 # these were found and how to re-find them on another board.
 JSBTN_Y=2            # rotate
+JSBTN_THEME=-1        # unbound: press a button and read `btn N (unbound)` in the log
 JSBTN_SELECT=6       # quit
 JSAXIS_DPAD_X=4      # ABS_HAT0X: negative is left, positive is right
 # ABS_HAT0Y is the companion axis, so it follows ABS_HAT0X. If a device ever
@@ -73,7 +75,6 @@ DISCOVER_EVERY_S=120
 BATT_EVERY_S=60
 BATT_LOW_PCT=15
 BATT_BUZZ_GAP_S=600
-SPEAK_EVERY_S=60
 RUMBLE_DEV=/sys/class/power_supply/axp2202-battery/moto
 BATT_SYS=/sys/class/power_supply/axp2202-battery
 PANEL_FLIP=0
@@ -102,6 +103,10 @@ compensated_orient() {
 IDX=0
 ORIENT=0
 PAGE=0
+# Empty means "whatever the PC is set to"; the theme button picks one from the
+# list the PC reports and from then on the choice is this handheld's.
+THEME=
+THEMES=
 # How many pages the PC draws. Replaced by whatever /config.json reports
 # on each connect; this is only what to assume before the first answer.
 PAGES=2
@@ -116,6 +121,24 @@ say() { echo "$(date '+%H:%M:%S') $*" >> "$log"; }
 
 save_state() {
     printf 'IDX=%s\nORIENT=%s\nPAGE=%s\n' "$IDX" "$ORIENT" "$PAGE" > "$state"
+}
+
+# The PC owns the theme list, so this walks whatever it reported. An unset
+# theme lands on the first one, which is what makes the first press do
+# something visible however the PC is configured.
+next_theme() {
+    [ -n "$THEMES" ] || return
+    first=
+    take=
+    new=
+    for t in $THEMES; do
+        [ -n "$first" ] || first=$t
+        [ "$take" = "1" ] && { new=$t; take=; }
+        [ "$t" = "$THEME" ] && take=1
+    done
+    [ -n "$new" ] || new=$first
+    THEME=$new
+    save_state
 }
 
 # Both directions exist even though there are only two pages today: UP and
@@ -284,66 +307,6 @@ battery_loop() {
     done
 }
 
-# --- spoken advice ---------------------------------------------------------
-# The PC decides everything: whether there is advice, whether it is worth saying
-# out loud, and what it sounds like. All this does is poll the PC that is
-# currently on screen, and play the clip once per advice id - which is also what
-# makes the announcement follow the device switcher rather than the LAN. Switch
-# to another PC and you hear that PC's advice, not this one's.
-# The video path here is ffmpeg writing to the framebuffer, which says nothing
-# about audio. ffplay is tried first because it needs no output device named on
-# the command line; ffmpeg piping to ALSA is the fallback for builds that ship
-# the muxers but not the player. If neither works it is logged once and the
-# stream carries on - a missing voice must never cost the picture.
-speak_play() {
-    if command -v ffplay >/dev/null 2>&1; then
-        ffplay -hide_banner -loglevel error -nodisp -autoexit -i "$1" \
-            >> "$log" 2>&1 && return 0
-    fi
-    if command -v ffmpeg >/dev/null 2>&1; then
-        ffmpeg -hide_banner -loglevel error -nostdin -i "$1" \
-            -f alsa default >> "$log" 2>&1 && return 0
-    fi
-    say "no audio player for advice playback"
-    return 1
-}
-
-speak_loop() {
-    spoken=""
-    seen_target=""
-    while [ ! -f "$stopflag" ]; do
-        target=$(cat "$targetfile" 2>/dev/null)
-        if [ -n "$target" ]; then
-            # A different PC has its own advice numbering, so the "already said
-            # this one" memory has to be per PC or the first advice from the
-            # machine you just switched to would be swallowed.
-            if [ "$target" != "$seen_target" ]; then
-                seen_target=$target
-                spoken=""
-            fi
-            js=$(curl -s -m 5 "$target/advice.json")
-            id=$(printf '%s' "$js" | jq -r '.id // empty' 2>/dev/null)
-            say_it=$(printf '%s' "$js" |
-                jq -r 'if .speak then 1 else 0 end' 2>/dev/null)
-            if [ -n "$id" ] && [ "$say_it" = "1" ] && [ "$id" != "$spoken" ]; then
-                if curl -s -m 20 -f -o "$audiofile" "$target/advice.audio"; then
-                    spoken=$id
-                    say "advice $id from $target, speaking"
-                    speak_play "$audiofile"
-                else
-                    say "advice $id has no audio yet"
-                fi
-            fi
-        fi
-
-        i=0
-        while [ $i -lt "$SPEAK_EVERY_S" ] && [ ! -f "$stopflag" ]; do
-            sleep 1
-            i=$((i + 1))
-        done
-    done
-}
-
 # --- button reader ---------------------------------------------------------
 # Writes an action then kills the player, in that order, so the main loop
 # always finds the action already waiting when the player returns.
@@ -381,6 +344,7 @@ keyreader() {
                 [ "$val" = "1" ] || continue        # press, not release
                 case "$8" in
                     "$JSBTN_Y") act=rotate ;;
+                    "$JSBTN_THEME") act=theme ;;
                     "$JSBTN_SELECT") act=quit ;;
                     *) say "btn $8 (unbound)"; continue ;;
                 esac
@@ -476,7 +440,7 @@ cleanup() {
     rm -f "$selfpid"
     [ -s "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null
     for p in "${KR_PID:-}" "${DISC_PID:-}" "${BATT_PID:-}" \
-         "${SPEAK_PID:-}" "${WD_PID:-}"; do
+         "${WD_PID:-}"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     rm -f "$targetfile" "$sweepflag"
@@ -514,8 +478,6 @@ discover_loop &
 DISC_PID=$!
 battery_loop &
 BATT_PID=$!
-speak_loop &
-SPEAK_PID=$!
 watchdog &
 WD_PID=$!
 
@@ -545,6 +507,7 @@ while :; do
             pageup) turn_page -1; continue ;;
             pagedown) turn_page 1; continue ;;
             rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state; continue ;;
+            theme) next_theme; continue ;;
             refresh) continue ;;
         esac
         # Nobody home: the list may be stale, so ask the discovery loop to
@@ -561,6 +524,11 @@ while :; do
     # An older PC build does not report a page count; it also only has one page,
     # so falling back to 1 is what keeps UP and DOWN from asking it for a page
     # it cannot draw.
+    # The theme list is a JSON array; only the names are wanted, space
+    # separated. An older PC reports none, and the button does nothing.
+    THEMES=$(printf '%s' "$conf" |
+        jq -r '(.themes // []) | join(" ")' 2>/dev/null)
+
     pages=$(printf '%s' "$conf" | jq -r '.pages // empty' 2>/dev/null)
     case "$pages" in
         '' | 0 | *[!0-9]*) PAGES=1 ;;
@@ -579,7 +547,7 @@ while :; do
     devs=$(device_list)
     say "connect $host idx=$IDX/$total orient=$ORIENT send=$send" \
         "srv_flip=$srv_flip rate=$rate devs=$devs"
-    play "$base/stream.mjpg?orient=$send&page=$PAGE&devs=$devs&i=$IDX" "$rate"
+    play "$base/stream.mjpg?orient=$send&page=$PAGE&devs=$devs&i=$IDX${THEME:+&theme=$THEME}" "$rate"
     say "player exit $?"
 
     take_cmd
@@ -595,6 +563,7 @@ while :; do
         pageup) turn_page -1 ;;
         pagedown) turn_page 1 ;;
         rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state ;;
+        theme) next_theme ;;
         refresh)
             new=$(grep -n "^$host|" "$hosts" 2>/dev/null | cut -d: -f1 | head -1)
             IDX=$([ -n "$new" ] && echo $((new - 1)) || echo 0)

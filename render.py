@@ -12,43 +12,54 @@ tile renderers at different sizes.
 
 Colour roles follow a validated categorical palette: one fixed hue per entity
 (never cycled), status hues reserved for state readouts (FPS, battery), and all
-text in ink tokens so identity always comes from a mark beside the text.
+text in ink tokens so identity always comes from a mark beside the text. Which
+palette those tokens hold comes from :mod:`theme`; every tile reads them as
+module globals, so switching theme is one rebind rather than a parameter
+threaded through forty drawing functions.
 """
 
 from __future__ import annotations
 
+import functools
 import math
+import os
+import subprocess
+import threading
 import time
 
 from PIL import Image, ImageDraw, ImageFont
 
+import rtss
+import sensors
+import theme as themes
+
 LANDSCAPE = (640, 480)
 PORTRAIT = (480, 640)
 
-# --- ink & surfaces (dark mode) ---
-PLANE = (13, 13, 13)
-SURFACE = (26, 26, 25)
-BORDER = (49, 49, 48)
-INK = (255, 255, 255)
-INK2 = (195, 194, 183)
-MUTED = (137, 135, 129)
-GRID = (44, 44, 42)
+# The palette tokens, bound here so every tile can read them as plain globals.
+# The names and values live in theme.py; these assignments only exist so the
+# module has a complete, valid palette before the first draw.
+PLANE = SURFACE = BORDER = INK = INK2 = MUTED = GRID = (0, 0, 0)
+C_CPU = C_GPU = C_MEM = C_DOWN = C_UP = C_FPS = C_AI = C_PWR = C_DISK = (0, 0, 0)
+S_GOOD = S_WARN = S_CRIT = (0, 0, 0)
+RADIUS = 7
 
-# --- one fixed hue per entity, in validated slot order ---
-C_CPU = (57, 135, 229)
-C_GPU = (217, 89, 38)
-C_MEM = (25, 158, 112)
-C_DOWN = (201, 133, 0)
-C_UP = (213, 81, 129)
-C_FPS = (144, 133, 233)
-C_AI = (0, 150, 163)
-C_PWR = (166, 118, 84)
-C_DISK = (127, 118, 191)
+# One renderer, one palette at a time: the frame loop draws every variant in a
+# single thread, but /frame.jpg and the preview script can ask for a differently
+# themed frame from another one, and a half-applied palette would be visible.
+_theme_lock = threading.RLock()
+_theme_name = themes.DEFAULT
 
-# --- reserved status hues (never used as a series) ---
-S_GOOD = (12, 163, 12)
-S_WARN = (250, 178, 25)
-S_CRIT = (208, 59, 59)
+
+def use_theme(name: str | None) -> str:
+    """Rebind the palette globals. Returns the theme actually applied."""
+    global _theme_name
+    _theme_name = themes.resolve(name)
+    globals().update(themes.palette(_theme_name))
+    return _theme_name
+
+
+use_theme(themes.DEFAULT)
 
 PAD, GAP, PADI = 8, 6, 10
 TITLE_H = 22
@@ -62,15 +73,60 @@ ARROW_W = 13
 # come first; the rest are fallbacks for machines that lack the YaHei collections
 # (Windows Server installs, N editions). Nothing is bundled: these faces are not
 # ours to redistribute.
+#
+# The Linux entries come after the Windows ones because the two sets never both
+# exist, so the order between them costs nothing. Distributions do not agree on
+# where CJK faces live, and a minimal server image ships none at all — hence the
+# fontconfig sweep below, and the README's note to install a Noto CJK package.
 _FONTS_BOLD = ("C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyh.ttc",
                "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/Deng.ttf",
-               "C:/Windows/Fonts/arialbd.ttf")
+               "C:/Windows/Fonts/arialbd.ttf",
+               "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+               "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+               "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+               "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Bold.ttc",
+               "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+               "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+               "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
 _FONTS_REG = ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
-              "C:/Windows/Fonts/Deng.ttf", "C:/Windows/Fonts/arial.ttf")
+              "C:/Windows/Fonts/Deng.ttf", "C:/Windows/Fonts/arial.ttf",
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+              "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+              "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
+              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 
 
-def _font(candidates: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont:
-    for path in candidates:
+def _fc_match(bold: bool) -> list[str]:
+    """CJK font files fontconfig knows about, best match first.
+
+    The hard-coded paths above cover the distributions this has been run on;
+    ``fc-match`` covers the ones it has not, at the cost of one subprocess during
+    startup. Absent on a minimal image, in which case there is nothing to find
+    anyway and the empty list just falls through.
+    """
+    if os.name == "nt":
+        return []
+    try:
+        proc = subprocess.run(
+            ["fc-match", "-f", "%{file}\n",
+             f":lang=zh-cn:weight={'bold' if bold else 'regular'}"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+@functools.lru_cache(maxsize=2)
+def _candidates(bold: bool) -> tuple[str, ...]:
+    """Known paths first, then whatever fontconfig suggests. Probed once."""
+    return (_FONTS_BOLD if bold else _FONTS_REG) + tuple(_fc_match(bold))
+
+
+def _font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
+    for path in _candidates(bold):
         # Index 1 of the YaHei collections is the "UI" face; older copies lack it.
         for index in (1, 0):
             try:
@@ -82,16 +138,16 @@ def _font(candidates: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont:
 
 class Fonts:
     def __init__(self):
-        self.hero = _font(_FONTS_BOLD, 52)
-        self.hero_sm = _font(_FONTS_BOLD, 40)
-        self.value = _font(_FONTS_BOLD, 32)
-        self.value_sm = _font(_FONTS_BOLD, 26)
-        self.value_xs = _font(_FONTS_BOLD, 21)
-        self.label = _font(_FONTS_BOLD, 15)
-        self.row = _font(_FONTS_BOLD, 13)
-        self.sub = _font(_FONTS_REG, 13)
-        self.meta = _font(_FONTS_REG, 12)
-        self.tiny = _font(_FONTS_REG, 11)
+        self.hero = _font(True, 52)
+        self.hero_sm = _font(True, 40)
+        self.value = _font(True, 32)
+        self.value_sm = _font(True, 26)
+        self.value_xs = _font(True, 21)
+        self.label = _font(True, 15)
+        self.row = _font(True, 13)
+        self.sub = _font(False, 13)
+        self.meta = _font(False, 12)
+        self.tiny = _font(False, 11)
 
 
 def blend(fg, bg, alpha: float):
@@ -118,10 +174,30 @@ def fmt_bytes(n: float) -> str:
     return f"{n / 1024:.0f} KB"
 
 
+# Measuring a string is as dear as drawing it, and the two functions below
+# measure the *same* strings over and over: ellipsize walks a label back one
+# character at a time, wrap walks a paragraph forward one character at a time,
+# and the next frame asks the identical questions again. Widths are a pure
+# function of (face, size, text), so they are worth remembering.
+_WIDTHS: dict[tuple, float] = {}
+
+
+def text_w(draw, text: str, font) -> float:
+    key = (getattr(font, "path", None) or id(font), getattr(font, "size", 0),
+           getattr(font, "index", 0), text)
+    width = _WIDTHS.get(key)
+    if width is None:
+        width = draw.textlength(text, font=font)
+        if len(_WIDTHS) > 20000:  # only reachable if the labels are unbounded
+            _WIDTHS.clear()
+        _WIDTHS[key] = width
+    return width
+
+
 def ellipsize(draw, text: str, font, max_w: int) -> str:
-    if draw.textlength(text, font=font) <= max_w:
+    if text_w(draw, text, font) <= max_w:
         return text
-    while text and draw.textlength(text + "…", font=font) > max_w:
+    while text and text_w(draw, text + "…", font) > max_w:
         text = text[:-1]
     return text + "…"
 
@@ -145,7 +221,7 @@ def wrap(draw, text: str, font, max_w: int, max_lines: int = 99) -> list[str]:
             lines.append(line)
             line = ""
             continue
-        if not line or draw.textlength(line + ch, font=font) <= max_w:
+        if not line or text_w(draw, line + ch, font) <= max_w:
             line += ch
             continue
         cut = len(line)
@@ -174,7 +250,7 @@ def wrap(draw, text: str, font, max_w: int, max_lines: int = 99) -> list[str]:
 
 def tile(d, box, fonts, title: str, meta: str = "") -> None:
     x0, y0, x1, _y1 = box
-    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    d.rounded_rectangle(box, radius=RADIUS, fill=SURFACE, outline=BORDER, width=1)
     d.text((x0 + PADI, y0 + 5), title, font=fonts.label, fill=INK2)
     if meta:
         d.text((x1 - PADI, y0 + 8), meta, font=fonts.meta, fill=MUTED, anchor="ra")
@@ -212,7 +288,11 @@ def spark(img, box, values, color, vmax: float | None = None, ss: int = 3) -> No
 
     d = ImageDraw.Draw(img)
     d.line((x0, y1, x1, y1), fill=GRID, width=1)
-    flat = layer.resize((w, h), Image.LANCZOS)
+    # BILINEAR rather than LANCZOS: Pillow antialiases on reduction with either,
+    # and for a 3x downscale of two flat shapes the difference peaks at 20/255 on
+    # the line's edge pixels — less than the JPEG quantisation that follows. It
+    # is worth measuring because the sparklines are a fifth of a frame's cost.
+    flat = layer.resize((w, h), Image.BILINEAR)
     img.paste(flat, (x0, y0), flat)
 
     ex = x0 + w - 1
@@ -249,12 +329,25 @@ def _temp_color(temp_c: float | None):
 
 # --- CPU ------------------------------------------------------------------
 
+CORE_GAP = 4
+CORE_BAR_H = 9
+
+
 def _core_grid(img, d, f, box, pcts, mhz) -> None:
     """One cell per logical core: a usage bar with its own clock above it.
 
     Cores are laid out in at most two rows so a 16-thread CPU still gets cells
     wide enough for a clock reading; past that the clocks are dropped rather than
     shrunk into illegibility, because the bars are the part you read at a glance.
+
+    Every cell is drawn to the same integer pitch and the same integer width,
+    because the grid is read by comparing the bars against each other: a cell one
+    pixel wider than its neighbour reads as a difference in the numbers rather
+    than in the layout, which is exactly the wrong thing to see. The rounding
+    slack collects as margin at the right edge instead of being handed to one
+    lucky column, a short last row is left short rather than spread out, and the
+    clocks are shown only when every core has one — a row of readings with one
+    "—" in it is the same kind of false difference.
     """
     x0, y0, x1, y1 = box
     n = len(pcts)
@@ -262,25 +355,24 @@ def _core_grid(img, d, f, box, pcts, mhz) -> None:
         return
     rows = 1 if n <= 8 else 2
     cols = int(math.ceil(n / rows))
-    cw = (x1 - x0) / cols
-    ch = (y1 - y0) / rows
+    pitch_x = (x1 - x0 + CORE_GAP) // cols
+    cw = max(6, pitch_x - CORE_GAP)
+    pitch_y = (y1 - y0) // rows
     # A cell fits its clock in 24px: an 11px label, a 9px bar and the gap. Below
     # that the clocks go rather than shrink, since the bars are what you read.
-    show_mhz = bool(mhz) and cw >= 30 and ch >= 24
-    bar_h = 9 if ch >= 22 else max(4, int(ch) - 4)
+    show_mhz = len(mhz) >= n and cw >= 30 and pitch_y >= 24
+    bar_h = CORE_BAR_H if pitch_y >= 22 else max(4, pitch_y - 4)
 
     for i, pct in enumerate(pcts):
         r, c = divmod(i, cols)
-        cx = x0 + c * cw
-        cy = y0 + r * ch
-        cell_w = cw - 4
+        cx = x0 + c * pitch_x
+        cy = y0 + r * pitch_y
         if show_mhz:
-            label = f"{mhz[i] / 1000:.1f}" if i < len(mhz) else "—"
-            d.text((cx, cy), label, font=f.tiny, fill=MUTED)
-            by = cy + ch - bar_h - 4
+            d.text((cx, cy), f"{mhz[i] / 1000:.1f}", font=f.tiny, fill=MUTED)
+            by = cy + pitch_y - bar_h - 4
         else:
-            by = cy + (ch - bar_h) / 2
-        meter(d, (cx, by, cx + cell_w, by + bar_h), pct / 100.0, C_CPU)
+            by = cy + (pitch_y - bar_h) // 2
+        meter(d, (cx, by, cx + cw, by + bar_h), pct / 100.0, C_CPU)
 
 
 def _cpu_tile(img, d, f, s, box) -> None:
@@ -294,7 +386,7 @@ def _cpu_tile(img, d, f, s, box) -> None:
 
     y = y0 + TITLE_H
     d.text((ix0, y), f"{c['percent']:.0f}%", font=f.value_sm, fill=INK)
-    vw = d.textlength(f"{c['percent']:.0f}%", font=f.value_sm)
+    vw = text_w(d, f"{c['percent']:.0f}%", f.value_sm)
 
     # Temperature and package power sit beside the headline number: they are CPU
     # state, not a series of their own, so they take status ink and no hue.
@@ -302,11 +394,11 @@ def _cpu_tile(img, d, f, s, box) -> None:
     if temp is not None:
         dot(d, tx, y + 9, _temp_color(temp), 4)
         d.text((tx + 13, y + 3), f"{temp:.0f}°C", font=f.value_xs, fill=INK2)
-        tx += 13 + d.textlength(f"{temp:.0f}°C", font=f.value_xs) + 12
+        tx += 13 + text_w(d, f"{temp:.0f}°C", f.value_xs) + 12
     if power is not None:
         d.text((tx, y + 3), f"{power:.0f} W", font=f.value_xs, fill=INK2)
     elif temp is None:
-        d.text((tx, y + 7), "温度需 Afterburner", font=f.tiny, fill=MUTED)
+        d.text((tx, y + 7), sensors.HINT, font=f.tiny, fill=MUTED)
 
     grid_top = y + 34
     if y1 - grid_top >= 22:
@@ -323,7 +415,7 @@ def _cpu_tile(img, d, f, s, box) -> None:
 def _fps_state(fps: dict):
     v = fps["value"]
     if v is None:
-        return ("RTSS 未运行" if not fps["rtss"] else "无游戏"), S_WARN
+        return (rtss.STATE_MISSING if not fps["rtss"] else "无游戏"), S_WARN
     if v >= 55:
         return "流畅", S_GOOD
     if v >= 30:
@@ -339,7 +431,7 @@ def _fps_tile(img, d, f, s, box) -> None:
     state, state_color = _fps_state(fps)
 
     tile(d, box, f, "游戏 FPS")
-    sw = d.textlength(state, font=f.meta)
+    sw = text_w(d, state, f.meta)
     dot(d, ix1 - sw - 13, y0 + 11, state_color, 4)
     d.text((ix1, y0 + 8), state, font=f.meta, fill=INK2, anchor="ra")
 
@@ -352,8 +444,7 @@ def _fps_tile(img, d, f, s, box) -> None:
     if v is None:
         d.text((ix0, y), "—", font=hero, fill=MUTED)
         if not fps["rtss"]:
-            hint = ("请启动 MSI Afterburner / RTSS" if ix1 - ix0 >= 220
-                    else "需 Afterburner / RTSS")
+            hint = rtss.HINT_LONG if ix1 - ix0 >= 220 else rtss.HINT_SHORT
         else:
             hint = "前台没有游戏画面"
         d.text((ix0, y + (54 if roomy else 42)), ellipsize(d, hint, f.sub, ix1 - ix0),
@@ -361,7 +452,7 @@ def _fps_tile(img, d, f, s, box) -> None:
         return
 
     d.text((ix0, y), f"{v:.0f}", font=hero, fill=state_color)
-    hw = d.textlength(f"{v:.0f}", font=hero)
+    hw = text_w(d, f"{v:.0f}", hero)
     d.text((ix0 + 5 + hw, y + (30 if roomy else 22)), "FPS", font=f.sub, fill=MUTED)
     # In a narrow tile the process name would ellipsize down to two letters, so
     # it yields to the frame time, which is short and always means something.
@@ -394,7 +485,7 @@ def _gpu_tile(img, d, f, s, box) -> None:
 
     y = y0 + TITLE_H
     d.text((ix0, y), f"{g['percent']:.0f}%", font=f.value_sm, fill=INK)
-    vw = d.textlength(f"{g['percent']:.0f}%", font=f.value_sm)
+    vw = text_w(d, f"{g['percent']:.0f}%", f.value_sm)
     dot(d, ix0 + vw + 10, y + 10, _temp_color(g["temp_c"]), 4)
     d.text((ix0 + vw + 23, y + 4), f"{g['temp_c']:.0f}°C · {g['power_w']:.0f} W",
            font=f.meta, fill=INK2)
@@ -413,7 +504,7 @@ def _gpu_tile(img, d, f, s, box) -> None:
         # bar being dropped, because "how full is the card" is the reading this
         # tile exists for on a machine that is running a game.
         d.text((ix0, y), label, font=f.tiny, fill=MUTED)
-        bx0 = ix0 + d.textlength(label, font=f.tiny) + 8
+        bx0 = ix0 + text_w(d, label, f.tiny) + 8
         if ix1 - bx0 >= 24:
             meter(d, (bx0, y + 3, ix1, y + 9), frac, C_GPU)
 
@@ -521,12 +612,12 @@ def _draw_runs(d, x, y, chunks, font, limit: float) -> None:
     """Coloured runs on one line, separated by a muted dot, truncated to fit."""
     for i, chunk in enumerate(chunks):
         parts = ([(" · ", MUTED)] if i else []) + list(chunk)
-        width = sum(d.textlength(t, font=font) for t, _ in parts)
+        width = sum(text_w(d, t, font) for t, _ in parts)
         if x + width > limit:
             return
         for text, ink in parts:
             d.text((x, y), text, font=font, fill=ink)
-            x += d.textlength(text, font=font)
+            x += text_w(d, text, font)
 
 
 # A window's own length, so how far into it we are can be worked out from the
@@ -600,7 +691,7 @@ def _ai_tile(img, d, f, s, box) -> None:
         tile(d, box, f, "AI 额度")
         top, bottom = y0 + TITLE_H, y1 - 18
     else:
-        d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+        d.rounded_rectangle(box, radius=RADIUS, fill=SURFACE, outline=BORDER, width=1)
         top, bottom = y0 + 4, y1 - 16
         chunks = [[("AI 额度", INK2)]] + chunks
 
@@ -610,7 +701,7 @@ def _ai_tile(img, d, f, s, box) -> None:
     for i, (label, value, frac, ink) in enumerate(cells):
         cx = ix0 + i * cw
         cell_w = cw - 10
-        vw = d.textlength(value, font=f.row)
+        vw = text_w(d, value, f.row)
         d.text((cx, top + 1), ellipsize(d, label, f.tiny, cell_w - vw - 5),
                font=f.tiny, fill=MUTED)
         d.text((cx + cell_w, top), value, font=f.row, fill=ink, anchor="ra")
@@ -631,7 +722,7 @@ def _ai_tile(img, d, f, s, box) -> None:
     if hint:
         text, ink = hint
         d.text((ix1, note_y), text, font=f.tiny, fill=ink, anchor="ra")
-        limit = ix1 - d.textlength(text, font=f.tiny) - 12
+        limit = ix1 - text_w(d, text, f.tiny) - 12
     _draw_runs(d, ix0, note_y, chunks, f.tiny, limit)
 
 
@@ -698,8 +789,8 @@ def _ai_detail_tile(img, d, f, s, box) -> None:
     # One shared left edge for every bar, and one shared right edge: a track
     # whose length depended on how long its label happened to be would make the
     # rows impossible to compare, which is the only reason to draw bars at all.
-    bx0 = ix0 + max([d.textlength(r[0], font=f.tiny) for r in rows] or [0]) + 12
-    bx1 = ix1 - max([d.textlength(r[1], font=f.row) for r in rows] or [0]) - 62
+    bx0 = ix0 + max([text_w(d, r[0], f.tiny) for r in rows] or [0]) + 12
+    bx1 = ix1 - max([text_w(d, r[1], f.row) for r in rows] or [0]) - 62
 
     for i, (label, value, frac, ink, reset) in enumerate(rows):
         ry = top + i * AI_ROW_H
@@ -734,7 +825,7 @@ def _weather_slim(img, d, f, s, box) -> None:
     """
     x0, y0, x1, y1 = box
     w = s.get("weather") or {}
-    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    d.rounded_rectangle(box, radius=RADIUS, fill=SURFACE, outline=BORDER, width=1)
     cy = (y0 + y1) // 2
 
     if not w.get("ok"):
@@ -762,7 +853,7 @@ def _weather_slim(img, d, f, s, box) -> None:
     cx = x0 + PADI
     limit = x1 - PADI
     for text, ink in segments:
-        width = d.textlength(text, font=f.tiny)
+        width = text_w(d, text, f.tiny)
         if cx + width > limit:
             break
         d.text((cx, cy), text, font=f.tiny, fill=ink, anchor="lm")
@@ -860,7 +951,7 @@ def _proc_tile(img, d, f, box, title, rows, color, empty: str, fmt=_as_pct,
         ry = top + i * row_h
         dot(d, ix0, ry + row_h / 2 - 3, color, 3)
         value_text = fmt(value)
-        pw = d.textlength(value_text, font=f.row)
+        pw = text_w(d, value_text, f.row)
         d.text((ix1, ry + row_h / 2), value_text, font=f.row, fill=INK, anchor="rm")
         d.text((ix0 + 12, ry + row_h / 2),
                ellipsize(d, name, f.meta, ix1 - ix0 - pw - 22),
@@ -882,7 +973,7 @@ def _power_strip(img, d, f, s, box) -> None:
     """
     x0, y0, x1, y1 = box
     p = s.get("power") or {}
-    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    d.rounded_rectangle(box, radius=RADIUS, fill=SURFACE, outline=BORDER, width=1)
     limit = x1 - PADI
 
     days = int(p.get("days") or 0)
@@ -898,13 +989,13 @@ def _power_strip(img, d, f, s, box) -> None:
         windows.append(("电费", _money(cost, "CNY")))
 
     def window_w(row) -> float:
-        return sum(d.textlength(n, font=f.tiny) + 5
-                   + d.textlength(v, font=f.row) + 16 for n, v in row)
+        return sum(text_w(d, n, f.tiny) + 5
+                   + text_w(d, v, f.row) + 16 for n, v in row)
 
     watts = f"{float(p.get('watts') or 0.0):.0f}"
-    head_w = (d.textlength("耗电量", font=f.label) + 12 + 13
-              + d.textlength(watts, font=f.value_xs) + 25)
-    meta_w = (d.textlength(meta, font=f.tiny) + 14) if meta else 0.0
+    head_w = (text_w(d, "耗电量", f.label) + 12 + 13
+              + text_w(d, watts, f.value_xs) + 25)
+    meta_w = (text_w(d, meta, f.tiny) + 14) if meta else 0.0
 
     # Two rows only when one will not do and the box is tall enough for them.
     stacked = (head_w + window_w(windows) + meta_w > limit - x0 - PADI
@@ -915,16 +1006,16 @@ def _power_strip(img, d, f, s, box) -> None:
     if meta:
         d.text((limit, head_y), meta, font=f.tiny, fill=MUTED, anchor="rm")
         if not stacked:
-            limit -= d.textlength(meta, font=f.tiny) + 14
+            limit -= text_w(d, meta, f.tiny) + 14
 
     cx = x0 + PADI
     d.text((cx, head_y), "耗电量", font=f.label, fill=INK2, anchor="lm")
-    cx += d.textlength("耗电量", font=f.label) + 12
+    cx += text_w(d, "耗电量", f.label) + 12
 
     dot(d, cx, head_y - 4, C_PWR, 4)
     cx += 13
     d.text((cx, head_y), watts, font=f.value_xs, fill=INK, anchor="lm")
-    cx += d.textlength(watts, font=f.value_xs) + 3
+    cx += text_w(d, watts, f.value_xs) + 3
     d.text((cx, head_y + 3), "W", font=f.tiny, fill=MUTED, anchor="lm")
     cx += 22
 
@@ -932,9 +1023,9 @@ def _power_strip(img, d, f, s, box) -> None:
         cx = x0 + PADI
     for name, value in windows:
         d.text((cx, row_y + 1), name, font=f.tiny, fill=MUTED, anchor="lm")
-        cx += d.textlength(name, font=f.tiny) + 5
+        cx += text_w(d, name, f.tiny) + 5
         d.text((cx, row_y), value, font=f.row, fill=INK, anchor="lm")
-        cx += d.textlength(value, font=f.row) + 16
+        cx += text_w(d, value, f.row) + 16
 
 
 # --- disk -----------------------------------------------------------------
@@ -995,7 +1086,7 @@ def _disk_tile(img, d, f, s, box) -> None:
     read = f"↓ {fmt_rate(float(dk.get('read_bps') or 0.0))}"
     write = f"↑ {fmt_rate(float(dk.get('write_bps') or 0.0))}"
     d.text((ix0, y), read, font=f.row, fill=INK)
-    if ix1 - ix0 - d.textlength(read, font=f.row) > d.textlength(write, font=f.row) + 8:
+    if ix1 - ix0 - text_w(d, read, f.row) > text_w(d, write, f.row) + 8:
         d.text((ix1, y), write, font=f.row, fill=INK, anchor="ra")
     else:
         y += 16
@@ -1051,7 +1142,7 @@ def _docker_tile(img, d, f, s, box) -> None:
             right = (right + "  " if right else "") + _as_mb(mem)
         if not right:
             right = ellipsize(d, c.get("status") or "", f.tiny, (x1 - x0) * 0.4)
-        rw = d.textlength(right, font=f.row if cpu is not None else f.tiny)
+        rw = text_w(d, right, f.row if cpu is not None else f.tiny)
         d.text((ix1, ry + row_h / 2), right,
                font=f.row if cpu is not None else f.tiny,
                fill=INK if cpu is not None else MUTED, anchor="rm")
@@ -1069,7 +1160,7 @@ def _docker_slim(img, d, f, s, box) -> None:
     """One line for the machines that have no Docker — which is most of them."""
     x0, y0, x1, y1 = box
     dk = s.get("docker") or {}
-    d.rounded_rectangle(box, radius=7, fill=SURFACE, outline=BORDER, width=1)
+    d.rounded_rectangle(box, radius=RADIUS, fill=SURFACE, outline=BORDER, width=1)
     cy = (y0 + y1) // 2
     d.text((x0 + PADI, cy), f"Docker {dk.get('err') or '—'}", font=f.meta,
            fill=MUTED, anchor="lm")
@@ -1143,7 +1234,7 @@ def _device_strip(d, f, x, y, avail: int, names, idx: int) -> None:
     window centred on the current device keeps it visible however long the list.
     """
     n = len(names)
-    widths = [d.textlength(nm, font=f.meta) + 16 for nm in names]
+    widths = [text_w(d, nm, f.meta) + 16 for nm in names]
     room = avail - (2 * ARROW_W if n > 1 else 0)
 
     lo, hi = _chip_window(widths, idx, room)
@@ -1193,7 +1284,7 @@ def _battery(d, f, x, y, batt: dict) -> float:
 
     text = f"{pct:.0f}%" + ("⚡" if charging else "")
     d.text((x + bw + 7, y - 2), text, font=f.meta, fill=color)
-    return bw + 7 + d.textlength(text, font=f.meta)
+    return bw + 7 + text_w(d, text, f.meta)
 
 
 def _weather_chip(d, f, s, right, y, room: float) -> float:
@@ -1208,16 +1299,32 @@ def _weather_chip(d, f, s, right, y, room: float) -> float:
     if not w.get("ok") or now.get("temp") is None:
         return 0.0
     text = f"{now.get('text') or ''} {now['temp']:.0f}°".strip()
-    width = d.textlength(text, font=f.meta)
+    width = text_w(d, text, f.meta)
     if width > room:
         return 0.0
     d.text((right, y), text, font=f.meta, fill=INK2, anchor="ra")
     return width
 
 
+# The handheld has no labels on its buttons and no menu to find them in, so the
+# key map lives on the screen — but as a footnote, in the muted ink and the
+# smallest face, below everything the dashboard is actually for. It is there to
+# be found once and then ignored, which is why it can be switched off entirely.
+HINT_H = 12
+HINTS = "↑↓ 翻页 · ←→ 换设备 · X 主题 · Y 转向 · MENU 退出"
+
+
+def _hint_bar(d, f, s, x0, x1, y) -> None:
+    """The key map as a footnote, when the settings page has left it on."""
+    if not s.get("hints", True):
+        return
+    d.text(((x0 + x1) // 2, y), ellipsize(d, HINTS, f.tiny, x1 - x0),
+           font=f.tiny, fill=MUTED, anchor="ma")
+
+
 def _header(d, f, s, w, devices=(), dev_idx: int = 0, battery=None) -> None:
     right = w - PAD - 2
-    tw = d.textlength(s["time"], font=f.label)
+    tw = text_w(d, s["time"], f.label)
     d.text((right, 3), s["time"], font=f.label, fill=INK, anchor="ra")
     right -= tw + 12
 
@@ -1285,7 +1392,10 @@ def _draw_landscape(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
     _disk_tile(img, d, f, s, (bx, 228, x1, 304))
     _net_tile(img, d, f, s, (x0, 310, x1, 378))
     _ai_tile(img, d, f, s, (x0, 384, x1, 428))
-    _power_strip(img, d, f, s, (x0, 434, x1, 472))
+    # The energy strip gives up the padding around its single row so the key map
+    # has a line to sit on; it is one row either way at this width.
+    _power_strip(img, d, f, s, (x0, 434, x1, 462))
+    _hint_bar(d, f, s, x0, x1, 465)
 
 
 def _draw_portrait(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
@@ -1311,8 +1421,14 @@ def _draw_portrait(img, d, f, s, devices=(), dev_idx=0, battery=None) -> None:
     _net_tile(img, d, f, s, (x0, 428, x1, 504))
     # Portrait has the height landscape does not, so the quota tile takes a
     # title bar here and puts the reset countdowns on a line of their own.
-    _ai_tile(img, d, f, s, (x0, 510, x1, 580))
-    _power_strip(img, d, f, s, (x0, 586, x1, 632))
+    # The key map's line is paid for by the quota tile rather than by the energy
+    # strip: the strip needs all 46px to keep its second row — at this width the
+    # windows do not fit on one line, and a strip that silently stopped after
+    # "近 7 天" would lose the figure it exists for. The quota tile gives up ten
+    # of its thirty pixels of gauge, which is still enough to draw the bars.
+    _ai_tile(img, d, f, s, (x0, 510, x1, 570))
+    _power_strip(img, d, f, s, (x0, 576, x1, 622))
+    _hint_bar(d, f, s, x0, x1, 625)
 
 
 # --- page 2: detail -------------------------------------------------------
@@ -1357,6 +1473,10 @@ def _draw_detail(img, d, f, s, size, dock_cap: int, devices, dev_idx,
     x0, x1 = PAD, w - PAD
     bottom = h - PAD
     _header(d, f, s, w, devices, dev_idx, battery)
+
+    if s.get("hints", True):
+        _hint_bar(d, f, s, x0, x1, bottom - HINT_H)
+        bottom -= HINT_H + 2
 
     # The forecast strip lives here now that page 1 only has room for the
     # current conditions in its header.
@@ -1409,23 +1529,25 @@ _CONTENT_ROTATION = {0: 0, 1: 270, 2: 180, 3: 90}
 
 def draw_layout(snapshot: dict, fonts: Fonts, portrait: bool = False,
                 devices=(), dev_idx: int = 0, battery=None,
-                page: int = 0) -> Image.Image:
+                page: int = 0, theme: str | None = None) -> Image.Image:
     """The layout at its natural size and upright — for humans looking at a screen."""
-    img = Image.new("RGB", PORTRAIT if portrait else LANDSCAPE, PLANE)
-    d = ImageDraw.Draw(img)
-    draw = _PAGES[page % PAGE_COUNT][1 if portrait else 0]
-    draw(img, d, fonts, snapshot, devices, dev_idx, battery)
+    with _theme_lock:
+        use_theme(theme)
+        img = Image.new("RGB", PORTRAIT if portrait else LANDSCAPE, PLANE)
+        d = ImageDraw.Draw(img)
+        draw = _PAGES[page % PAGE_COUNT][1 if portrait else 0]
+        draw(img, d, fonts, snapshot, devices, dev_idx, battery)
     return img
 
 
 def render(snapshot: dict, fonts: Fonts, orient: int = 0,
            panel_flip: bool = True, devices=(), dev_idx: int = 0,
-           battery=None, page: int = 0) -> Image.Image:
+           battery=None, page: int = 0, theme: str | None = None) -> Image.Image:
     """The frame as the handheld should receive it, mapped onto the panel."""
     orient %= 4
     img = draw_layout(snapshot, fonts, portrait=orient in (1, 3),
                       devices=devices, dev_idx=dev_idx, battery=battery,
-                      page=page)
+                      page=page, theme=theme)
 
     rotation = _CONTENT_ROTATION[orient]
     if rotation:

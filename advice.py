@@ -298,12 +298,11 @@ class Advisor(threading.Thread):
     # get their own short retry rather than the five minutes a failed call earns.
     WARMUP_S = 60.0
 
-    def __init__(self, history: History, cfg=None, snapshot=None, speak=None):
+    def __init__(self, history: History, cfg=None, snapshot=None):
         super().__init__(daemon=True)
         self.history = history
         self._cfg = cfg or (lambda: {})
         self._snapshot = snapshot or (lambda: {})
-        self._speak = speak
         self.data: dict = {"enabled": False, "ok": False, "err": None,
                            "text": "", "level": "ok", "provider": "",
                            "at": None, "id": 0}
@@ -376,10 +375,6 @@ class Advisor(threading.Thread):
             "id": int(self.data.get("id") or 0) + 1,
         }
         self.data = entry
-        # Only a problem is worth interrupting someone with; "正常" every half
-        # hour out loud would be the fastest way to get the feature turned off.
-        if self._speak and not normal and cfg.get("speak_enabled"):
-            self._speak(entry["text"], entry["id"])
         return 0.0
 
 
@@ -389,13 +384,13 @@ if __name__ == "__main__":
 
     settings = {"advice_enabled": True, "advice_every_min": 30}
     try:
-        with open(os.path.join(paths.base_dir(), "config.json"),
+        with open(os.path.join(paths.state_dir(), "config.json"),
                   encoding="utf-8") as fh:
             settings.update(json.load(fh))
     except (OSError, ValueError):
         pass
 
-    log = History(os.path.join(paths.base_dir(), "history.jsonl"))
+    log = History(os.path.join(paths.state_dir(), "history.jsonl"))
     collector = metrics.Collector()
     time.sleep(3.0)
     for _ in range(3):

@@ -1,7 +1,7 @@
 # PC Monitor — 掌机 WiFi 实时看电脑状态
 
-在 Windows PC 上跑一个小服务，把 CPU / 内存 / 网络 / GPU / 游戏 FPS 画成一张
-仪表盘，通过 WiFi 以 MJPEG 流推给掌机全屏显示。掌机会自己扫局域网找出所有能监控
+在 Windows PC（或 Linux 服务器）上跑一个小服务，把 CPU / 内存 / 网络 / GPU /
+游戏 FPS 画成一张仪表盘，通过 WiFi 以 MJPEG 流推给掌机全屏显示。掌机会自己扫局域网找出所有能监控
 的 PC，左右键切换，Y 键转屏（支持竖屏），自己的电量也会显示在顶栏、低电量时震动。
 
 支持三类掌机，共用同一个 PC 端服务：
@@ -45,6 +45,13 @@ GPU 占用 / 温度 / 功耗 / 显存、CPU / GPU / 内存 各自占用前三的
 |---|---|
 | ![竖版详情](preview_portrait_docker.png) | ![竖版详情无docker](preview_portrait_nodocker.png) |
 
+换个主题（掌机上按 **X**，网页版上按 **T**，或在设置页里改默认值）——「终端绿」是
+黑底绿字的终端风格，各项指标改用鲜艳的 ANSI 色区分，圆角也收成直角：
+
+| 终端绿 · 横版 | 终端绿 · 竖版 |
+|---|---|
+| ![终端绿横版](preview_landscape_term.png) | ![终端绿竖版](preview_portrait_term.png) |
+
 > 这些图由 `python preview.py` 重新生成，方便改版式后第一时间肉眼检查。
 
 ## 组成
@@ -53,23 +60,27 @@ GPU 占用 / 温度 / 功耗 / 显存、CPU / GPU / 内存 各自占用前三的
 |---|---|
 | `server.py` | MJPEG 服务，帧生产线程 + HTTP 接口 |
 | `metrics.py` | 采集 CPU / 内存 / 网络 / GPU / 进程 / 当日流量 |
+| `sysinfo.py` | 这些数从哪来：Windows 上是 psutil，Linux 上直接读 `/proc`（于是 Linux 端零第三方依赖） |
 | `power.py` | 整机功耗估算与按天累计（今日 / 近 7 天 / 近 30 天） |
 | `dockerstat.py` | 后台调 `docker ps` / `docker stats`，没装 Docker 也不报错 |
-| `diskstat.py` | 系统盘温度（免管理员的 IOCTL）与读写速度、容量 |
+| `diskstat.py` | 系统盘温度（Windows 免管理员的 IOCTL / Linux 的 hwmon）与读写速度、容量 |
 | `advice.py` | 运行状况快照留存，定期让 AI 判断有没有异常 |
-| `tts.py` | 把建议合成语音（MiniMax 在线 / Windows 本地二选一） |
-| `perfcounters.py` | 通过 PDH 性能计数器读 CPU / GPU 各进程占用（带本地化处理） |
-| `sensors.py` | 从 MSI Afterburner 共享内存读 CPU 温度 / 功耗 / 每核频率 |
-| `rtss.py` | 从 RivaTuner 共享内存读游戏 FPS |
+| `perfcounters.py` | 通过 PDH 性能计数器读 CPU / GPU 各进程占用（带本地化处理，仅 Windows） |
+| `sensors.py` | CPU 温度 / 功耗 / 每核频率：Windows 读 MSI Afterburner 共享内存，Linux 读 hwmon + cpufreq + RAPL |
+| `rtss.py` | 从 RivaTuner 共享内存读游戏 FPS（仅 Windows） |
 | `weather.py` | 天气：公网 IP 定位 / 城市名解析 / 经纬度，Open-Meteo 免费接口 |
 | `aiquota.py` | 轮询 Claude / DeepSeek / MiniMax 的额度与余额 |
+| `alerts.py` | 5 小时额度过线时记一条告警（写日志与 `/alert.json`） |
+| `theme.py` | 配色主题（深色 / 终端绿），串流和网页版共用一套 |
+| `webui.py` | 高清网页版仪表盘，浏览器里矢量重绘，键盘 / 按钮 / 触摸操作 |
 | `webjson.py` | 共享的 HTTP GET + JSON 小助手 |
 | `render.py` | Pillow 绘制仪表盘（横/竖两套版式 + 旋转 + 180° 预旋转） |
 | `preview.py` | 用假数据出图，改版式时看效果 |
 | `make_icon.py` | 生成掌机启动器图标 |
 | `deploy_device.py` | 把掌机端推送过去（`--miyoo` / `--rocknix` / `--muos`） |
-| `paths.py` | 区分「exe 旁边的可写文件」和「打包进去的只读文件」 |
+| `paths.py` | 区分代码目录和可写的状态目录（exe 旁边 / `PCMON_DATA` / `~/.local/share`） |
 | `build_exe.py` | 打包成单文件 `dist/PCMonitor.exe` |
+| `build_deb.py` | 打包成 `dist/pcmon_1.0.4_all.deb`，装完即是一个 systemd 服务 |
 | `device/` | 掌机端，一个固件一套：Onion 用 `launch.sh` / `config.json` / `settings.cfg`；ROCKNIX 用 `launch_rocknix.sh` / `settings_rocknix.cfg`；muOS 用 `mux_launch.sh` / `launch_muos.sh` / `settings_muos.cfg` |
 
 ## 用 exe 跑（推荐，换机器不用装环境）
@@ -86,7 +97,8 @@ python build_exe.py
   `__file__` 指向一个退出即删的解包目录，所以这两个路径走 `paths.base_dir()`）。
   换句话说，exe 放哪儿，配置和当日流量就存哪儿。
 - 开机自启：`PCMonitor.exe --install-autostart`，取消用 `--remove-autostart`。
-  它在「启动」文件夹里写一个 `PC Monitor.cmd`，不需要管理员权限。
+  它在「启动」文件夹里写一个 `PC Monitor.vbs`，不需要管理员权限。用 VBScript 通过
+  `WScript.Shell.Run` 以隐藏窗口方式拉起 exe，开机不会闪出控制台窗口，静默在后台跑。
 - 换端口：`PCMonitor.exe --port 8888`（或改 `config.json` 里的 `port`）。
 - 首次运行 Windows SmartScreen 可能提示未知发布者——exe 没有代码签名，选「仍要运行」。
 
@@ -103,7 +115,8 @@ python build_exe.py
 python -m pip install psutil pillow paramiko
 ```
 
-`paramiko` 只在部署到掌机时需要。
+`paramiko` 只在部署到掌机时需要。**Linux 上不用装 `psutil`**——那边的采集走
+`sysinfo.py` 直接读 `/proc`，只需要 `pillow`，见下面「在 Linux 上跑」。
 
 1. **PC 端启动**：双击 `start.bat`，或 `python server.py`。
    启动时会打印地址：
@@ -136,6 +149,167 @@ python -m pip install psutil pillow paramiko
 > ⚠️ **重新部署前先在掌机上退出本应用。** busybox 的 sh 会边跑边读脚本文件，
 > 覆盖正在运行的 `launch.sh` 会让它执行错乱并留下一堆僵尸进程。
 
+## 在 Linux 上跑（监视 Linux 服务器）
+
+服务端本身跑在哪台机器上，仪表盘画的就是哪台机器。所以把它装到一台 Linux
+服务器上，掌机和网页版就多出一台可以切换过去看的主机——不需要改掌机端任何东西，
+自动发现走的是同一个端口。
+
+### 用 deb 包装（Ubuntu / Debian，推荐）
+
+```
+python3 build_deb.py                        # 产出 dist/pcmon_1.0.4_all.deb（97 kB）
+scp dist/pcmon_1.0.4_all.deb 服务器:/tmp/
+sudo apt install /tmp/pcmon_1.0.4_all.deb   # 依赖由 apt 装
+```
+
+装完服务就已经在跑了，安装脚本会把本机地址打印出来，直接浏览器打开
+`http://<服务器IP>:8765/settings`。
+
+**依赖只有两个，而且都是必须的**：
+
+| 依赖 | 为什么去不掉 |
+|---|---|
+| `python3-pil` | 推给掌机的是 JPEG 帧，纯 Python 编码 8 fps 是不可能的 |
+| `fonts-wqy-zenhei`（或 `fonts-noto-cjk`） | 界面标签全是中文，一个 CJK 字体都没有的话 Pillow 只能回退到点阵字体，画出来是一片方块。文泉驿体积只有 Noto CJK 的五分之一，两个装了哪个都行 |
+
+除此之外全走标准库：Linux 上**不需要 psutil**——它读的就是 `/proc`，那些文件
+`sysinfo.py` 自己读（见下）。Python 要 **3.10 以上**，也就是 Ubuntu / Pop!_OS
+22.04 自带的版本。包是 `Architecture: all`，没有任何编译产物，装完 70 kB。
+
+安装时会用目标机自己的 `python3` 把源码编译一遍：既缓存了 `.pyc` 让启动快一点，
+也顺手验证了这台机器的 Python 版本确实够用——不够会在 apt 的输出里直接报出来。
+
+**为什么是 deb 而不是像 Windows 那样打一个单文件可执行程序**：剩下的依赖本来就是
+发行版里的包。声明依赖让 apt 去装，Pillow 就跟着发行版一起打安全更新——于是
+「装 40 MB 自带副本」变成了「装 70 kB Python 源码」。
+
+| 装到哪 | 是什么 |
+|---|---|
+| `/usr/lib/pcmon/*.py` | 程序本体，root 所有、只读 |
+| `/usr/bin/pcmon` | 手动跑一次用（这样跑时状态存 `~/.local/share/pcmon`） |
+| `/usr/lib/systemd/system/pcmon.service` | 系统服务，装完即 enable + start |
+| `/var/lib/pcmon/` | `config.json` 和各种计数，服务通过 `PCMON_DATA` 指过来 |
+
+```
+systemctl status pcmon          # 状态
+journalctl -u pcmon -f          # 日志
+sudo apt remove pcmon           # 卸载，保留设置和累计数据
+sudo apt purge  pcmon           # 连 /var/lib/pcmon 和 pcmon 用户一起删
+```
+
+### CPU 占用
+
+渲染 + JPEG 编码是这个程序唯一的重活，采集本身可以忽略（每次 `sample()` 0.59 ms，
+8 fps 也就 0.5% 一个核）。一帧的成本实测（i7 台式机，640×480）：
+
+| | 每帧 | 8 fps 时 |
+|---|---|---|
+| 渲染 | 11.9 ms | 9.5% 一个核 |
+| JPEG 编码 | 0.8 ms | 0.6% |
+
+其中一半是文字光栅化——整屏有 ~100 次 `draw.text`，这是「PC 画图、掌机只解码」
+这个设计的固有成本。低功耗笔记本上一帧要 40 ms 上下，8 fps 就是 30% 左右。
+
+三个降低占用的办法，按效果排序：
+
+1. **没人看的时候本来就不画图**。每个取帧的入口（掌机的 `stream.mjpg`、
+   `/frame.jpg`、设置页的预览）都会先登记自己要哪个版式，没人登记时帧循环
+   一张都不画——空闲占用因此是 0.5% 而不是一个满核。
+2. **用网页版看**。`/hd` 完全不触发渲染，是浏览器拿 `/stats.json` 自己矢量重绘的。
+3. **调低设置页里的帧率**。这是唯一线性的旋钮：8 → 4 fps 占用减半。掌机会自动跟随
+   （它从服务端读 `fps` 再传给 ffplay / mpv 的 `-framerate`），不用改掌机端。
+   代价是走势线的时间跨度跟着变：历史固定 72 个采样点，8 fps 是最近 9 秒，
+   2 fps 就是最近 36 秒——对一台服务器来说后者反而更有意义。
+
+服务以专用系统用户 `pcmon` 运行，unit 里开了 `ProtectSystem=strict` /
+`ProtectHome=read-only` / `NoNewPrivileges` 等一串限制——它毕竟是个对局域网开着
+的 HTTP 服务，只该有读 `/proc`、`/sys` 的权限。两个后果，都是有意的：
+
+- **Docker 那一格默认是空的**，因为 `pcmon` 不在 `docker` 组里。分两种情况：
+  - **rootful**（`dockerd` 由 root 跑）：`sudo adduser pcmon docker` 之后
+    **必须 `sudo systemctl restart pcmon`**——组成员身份是进程启动时读的，
+    不重启永远不生效。代价是这个账号从此等同 root，自己权衡。
+  - **rootless**（`dockerd` 跑在你自己账号下，`ps` 里能看到 `rootlesskit`）：
+    加组没有任何用，因为压根没有 root 的守护进程。它的 socket 在
+    `/run/user/<你的uid>/docker.sock`，那个目录是 0700，别的账号进不去。
+    唯一的办法是让 PC Monitor 也跑在你自己账号下——停掉系统服务，改用
+    `pcmon --install-autostart` 装成用户服务（见上一节）。这种情况下
+    `dockerstat.py` 会自己去 `$XDG_RUNTIME_DIR/docker.sock` 找 socket 并设好
+    `DOCKER_HOST`，不需要你在 profile 里 export 什么。
+
+  容器那一格读不到时会写明原因：`未安装` / `服务未运行` / `无权访问 docker.sock`，
+  其它错误直接显示 docker 自己的第一行报错。
+- **Claude 额度读不到**，那是从 `~/.claude/.credentials.json` 读的，属于你自己的
+  账号。想要就 `sudo systemctl edit pcmon` 加一行 `User=你的用户名`。
+
+`build_deb.py` 在哪台机器上跑都行，只要有 `dpkg-deb`；仓库放在 Windows 盘上、
+从 WSL 里构建也可以，它会自己换到 Linux 的临时目录里打包（`/mnt/c` 上的权限位
+存不住，dpkg-deb 会拒绝）。
+
+### 或者直接从源码跑
+
+```
+sudo apt install python3-pil fonts-wqy-zenhei          # Debian / Ubuntu
+sudo dnf install python3-pillow wqy-zenhei-fonts       # Fedora
+./start.sh                       # 或 python3 server.py
+```
+
+需要 **Python 3.10 以上**。字体找不到硬编码路径时还会问一次 `fc-match`，
+所以装别的 CJK 字体也行。
+
+这样跑时开机自启走 **systemd 用户服务**，和 Windows 那边一样不需要 root：
+
+```
+python3 server.py --install-autostart     # 写 ~/.config/systemd/user/pcmonitor.service 并启用
+sudo loginctl enable-linger $USER         # 关键：让它在你退出登录后继续跑
+journalctl --user -u pcmonitor -f         # 看日志
+python3 server.py --remove-autostart      # 撤销
+```
+
+服务器上没登录会话时用户服务默认不启动，`enable-linger` 就是那句让它常驻的命令。
+这条路子的好处是跑在你自己账号下：Claude 额度和 Docker 都直接能读到。
+
+### 配置和数据存在哪
+
+一句话：**Windows 上在程序旁边，Linux 上看情况**。`paths.state_dir()` 按这个顺序定：
+
+1. 环境变量 `PCMON_DATA`（deb 的 unit 用它指向 `/var/lib/pcmon`）；
+2. 程序所在目录，如果可写——源码 checkout 和 Windows 的 exe 都走这条，
+   所以一份拷贝就是自包含的；
+3. 否则 `~/.local/share/pcmon`——deb 装的代码是 root 所有的，手动跑 `pcmon`
+   时就落在这里，不会和服务抢同一个文件。
+
+### 哪些指标在 Linux 上有、哪些没有
+
+| 指标 | Linux 上的来源 | 说明 |
+|---|---|---|
+| CPU 占用 / 内存 / 网络 / 当日流量 | psutil | 与 Windows 完全一致 |
+| CPU 温度、每核温度 | `/sys/class/hwmon`（`coretemp` / `k10temp`） | 不用装任何东西；AMD 只有一个整体温度，没有分核 |
+| 每核频率 | cpufreq，退回 `/proc/cpuinfo` | 比 Windows 那边还准，不需要 Afterburner |
+| CPU 功耗 | RAPL `energy_uj` | **通常需要 root**：内核 5.10 起该文件只有 root 可读，读不到就退回按 TDP 估算 |
+| 进程占用前三（CPU / 内存） | `/proc` | 内存口径是 RSS，不是 Windows 的私有工作集，同名进程会略偏高 |
+| GPU 占用 / 温度 / 功耗 / 显存 | `nvidia-smi` | 和 Windows 同一条命令，没装驱动就不显示这块 |
+| GPU 进程排行 | `nvidia-smi pmon` | 需要 NVIDIA 驱动；失败后 5 分钟才重试一次，不占用采集线程 |
+| 硬盘温度 | `/sys/block/<盘>/device/hwmon*` | NVMe 直接有；SATA 需要 `modprobe drivetemp` |
+| 硬盘读写 / 容量 | `/proc/diskstats` + `statvfs` | 设置页里填**挂载点**（如 `/` 或 `/data`），不是盘符 |
+| 整机耗电量 | 由上面的功耗积分 | CPU 功耗读不到时按 TDP 估，和 Windows 一样是估算 |
+| 游戏 FPS | — | RTSS 是 Windows 的东西，Linux 上这块显示「无 FPS 源」 |
+| Docker / 天气 / AI 额度 / AI 建议 | 和 Windows 一样 | 纯网络或纯 CLI，没有平台差异 |
+
+想让 CPU 功耗也准，两个办法：用 root 跑（不推荐，为一个数字放大整个程序的权限），
+或者放开 RAPL 的读权限：
+
+```
+sudo chmod a+r /sys/class/powercap/intel-rapl:0/energy_uj    # 重启后失效
+```
+
+要长期生效就写一条 udev 规则。读不到也没关系——设置页里的「CPU TDP」就是给这种
+情况用的，功耗会按占用率推算出来，只是不如实测。
+
+> 单文件可执行程序（`build_exe.py`）只做了 Windows 版。Linux 那边对应的是上面的
+> deb 包：发行版都自带 Python，声明依赖比搬一个 20 MB 的二进制干净。
+
 ## 掌机上的操作
 
 | 按键 | 作用 |
@@ -143,12 +317,22 @@ python -m pip install psutil pillow paramiko
 | **LEFT / RIGHT** | 切换设备（在扫到的 PC 之间循环） |
 | **UP / DOWN** | 翻页：总览 ⇄ 详情 |
 | **Y** | 转屏，4 档：横向 → 竖向 → 横向倒置 → 竖向（另一侧） |
+| **X** | 换主题，在 PC 报上来的主题列表里循环 |
 | **MENU** | 退出 |
 
-当前选的设备、朝向和页码记在 `state.cfg` 里，下次打开还是这个视角。
+掌机的按钮上没有字，所以这张表也画在画面上：**最底下一行灰色小字**就是它
+（`↑↓ 翻页 · ←→ 换设备 · X 主题 · Y 转向 · MENU 退出`）。记熟了在设置页里关掉
+`device_hints`，那一行的空间就还给仪表盘。
 
-页数不写死在掌机脚本里：每次连上时从 PC 的 `/config.json` 读 `pages`，所以以后
-服务端加页不用重新推掌机脚本。老版本 PC 不返回这个字段，掌机就当它只有一页。
+当前选的设备、朝向、页码和主题记在 `state.cfg` 里，下次打开还是这个视角。
+
+页数和主题列表都不写死在掌机脚本里：每次连上时从 PC 的 `/config.json` 读 `pages`
+和 `themes`，所以以后服务端加页、加主题都不用重新推掌机脚本。老版本 PC 不返回这两个
+字段，掌机就当它只有一页、没有主题可换。
+
+muOS 那台的按钮编号不按常规排（Y 在 2、SELECT 在 6，都是实测出来的），所以 X 键
+默认没绑：按一下任意键，日志里会写 `btn N (unbound)`，把那个 N 填进
+`launch_muos.sh` 的 `JSBTN_THEME` 即可。
 
 ### 屏幕上的设备条
 
@@ -222,8 +406,11 @@ ROCKNIX 上尺寸正好对得上：sway 用 `transform=270` 驱动 DSI-1，逻�
 - **天气位置**：经纬度 / 城市名 / 都留空自动定位（见「天气小组件」）
 - **DeepSeek / MiniMax key**：写进去就生效，页面永远不回显已保存的 key
   （留空＝不改，要删得勾「删除已保存的 key」）
+- **网页版（`/hd`）**：刷新间隔 0.25–10 秒（带 4 档预设）、要不要让它监视局域网里的
+  其他主机（下面写着上一轮扫到了谁）、扫不到的机器手填、掌机与网页两行按键提示的开关、
+  网页底部按钮栏的开关
 - **耗电量估算**：其余部分功耗、电源效率、CPU TDP、电价，以及磁盘监控的盘符
-- **AI 运行状况建议**与**语音播报**两个开关，加分析间隔
+- **AI 运行状况建议**开关，加分析间隔
 - 一张信息卡显示掌机当前朝向、当前页码、扫到的设备和掌机电量
 - 页脚带一路实时预览（始终是正着的，跟着掌机的横竖切换，可切页）
 
@@ -249,15 +436,22 @@ PC 端 `config.json`（`port` 只能在这里改，改完要重启服务）：
 | `weather_city` / `weather_lat` / `weather_lon` | 空 / 空 / 空 | 天气定位：见「天气小组件」，三选一 |
 | `deepseek_key` | 空 | DeepSeek 额度查询的 API key |
 | `minimax_key` / `minimax_region` | 空 / `cn` | MiniMax 额度查询的 API key 与地域 |
-| `aimon_port` | 9000 | 额外监听的 aimon 兼容端口，提供 `/api/info` 和 `/api/usage`；0 关闭（改完要重启） |
 | `power_base_w` | 45 | 耗电估算里「其余部分」的功耗（主板 / 内存 / 硬盘 / 风扇） |
 | `power_psu_pct` | 90 | 电源效率百分比 |
 | `cpu_tdp_w` | 65 | 读不到 CPU 功耗传感器时用来推算的 TDP |
 | `power_price` | 空 | 电价（元/度），填了才显示电费 |
 | `advice_enabled` | false | 定期让 AI 判断运行状况 |
 | `advice_every_min` | 30 | 分析间隔（分钟，最少 5） |
-| `speak_enabled` | false | 发现异常时合成语音让掌机播报 |
 | `disk_letter` | `C` | 磁盘监控看哪个盘（改完要重启） |
+| `theme` | `dark` | 默认主题：`dark`（深色）/ `term`（终端绿）。掌机和网页可以各自临时换 |
+| `ai_alert_enabled` | true | 5 小时额度过线时记一条告警 |
+| `ai_alert_pct` | 80 | 上面这个的阈值（%） |
+| `web_refresh_ms` | 1000 | 高清网页版取一次数据的间隔（250–10000 毫秒）。网页上按 `[` `]` 可以临时改，这里是默认值 |
+| `web_scan` | true | 允许 PC 扫本网段，供网页版切换到局域网里的其他主机 |
+| `web_hosts` | 空 | 扫不到的主机，写成 `ip` 或 `ip:port`，逗号分隔，并进扫描结果里 |
+| `device_hints` | true | 掌机画面最底下那行灰色按键提示 |
+| `web_hints` | true | 网页版顶栏右边那行灰色按键提示 |
+| `web_buttons` | true | 网页版底部那排按钮（手机 / 触摸屏用，键盘党可以关掉） |
 
 掌机端（Onion 在 `/mnt/SDCARD/App/PCMonitor/`，ROCKNIX 在
 `/storage/roms/ports/pcmonitor/`）：
@@ -266,7 +460,7 @@ PC 端 `config.json`（`port` 只能在这里改，改完要重启服务）：
 |---|---|
 | `settings.cfg` | `PC_PORT`（扫描用的端口，两边必须一致）；`PC_HOST` 只是首次运行的种子地址；`STREAM_FPS` 是读不到 `/config.json` 时的兜底帧率；`DISCOVER_EVERY_S` 控制局域网重新扫描的间隔；`BATT_EVERY_S` / `BATT_LOW_PCT` / `BATT_BUZZ_GAP_S` 控制电量上报与震动；ROCKNIX 多一个 `PANEL_FLIP` |
 | `hosts.txt` | 扫到的设备表，每行 `IP\|主机名`，自动维护 |
-| `state.cfg` | 上次选的 `IDX` 和 `ORIENT` |
+| `state.cfg` | 上次选的 `IDX`、`ORIENT`、`PAGE` 和 `THEME` |
 | `pcmonitor.log` | 本次运行的日志，每次启动清空 |
 | `.pid` | 运行中的实例 PID，启动时用它结束上一个实例 |
 
@@ -399,6 +593,20 @@ Opus 和 `extra` 计费额度不是平时会盯着的东西，挪到了第二页
 省下的宽度用来给每格写上**重置倒计时**——倒计时用亮色，不足 1 小时转成橙色，
 因为这是这一行里唯一需要据此行动的信息。
 
+### 额度告警（5 小时）
+
+5 小时窗口是真正会在半路把你拦下来的那一个，而它又很容易在不看仪表盘的时候悄悄
+走到头。所以用量过线（默认 80%，设置页可改）时会**记一条告警**：一行日志、设置页上
+的「上次」、还有 `/alert.json`。
+
+它不出声，也不在网页版顶上弹条——这两样后来都去掉了。留下的是记录，谁想在上面
+接自己的通知，读 `/alert.json` 就行。
+
+- **一个窗口只记一次。** 额度每分钟查一次，但每八分之一秒重复一遍的告警只是噪音。
+  窗口用它的重置时间来标识，所以同一个窗口只会触发一次，下一个窗口自己重新武装；
+  provider 没给重置时间时退化成滞回：要掉到阈值以下 10 个百分点才重新武装。
+- Claude 和 MiniMax 的 5 小时窗口都在看，先过线的先记。
+
 ### 用快了还是用少了
 
 额度条旁边还有一句高亮提示。判断的是**节奏**而不是水位：同样用掉 60%，在 5 小时
@@ -454,22 +662,6 @@ CPU 封装功耗来自 Afterburner，显卡功耗来自 nvidia-smi；读不到 C
   硬凑出来的建议只会让人不再看这块。
 - 发出去的只有汇总后的统计数字和进程名，不含文件路径、窗口标题或任何 key。
 
-### 语音播报
-
-设置页里单独开关。**只有判定为异常时才播**，正常不出声。
-
-语音在 PC 上合成，掌机把音频拉过去播：
-
-- 配了 MiniMax key 就用 MiniMax 的语音接口合成中文（每次消耗一点额度）；
-- 否则用 Windows 自带的 `System.Speech`，不联网——但它只会读装了语音包的语言。
-  英文版 Windows 默认只有英文语音，拿它读中文会**静悄悄地跳过每个读不出的字**，
-  所以这里会先检查语音列表，没有中文语音就直接说明，而不是合成半句话。
-  装中文语音：设置 → 时间和语言 → 语音 → 添加语音 → 中文(简体)。
-
-掌机每分钟问一次**当前正在看的那台 PC** 的 `/advice.json`，`speak` 为真且 `id` 变了
-才拉 `/advice.audio` 播放一次。所以播报跟着设备切换走：切到另一台 PC，听到的就是
-那台的建议，不会串台。
-
 ## Docker 容器
 
 第二页会列出这台机器上的容器：状态圆点（绿=运行、黄=暂停/创建、灰=已退出）、
@@ -484,17 +676,110 @@ CPU 封装功耗来自 Afterburner，显卡功耗来自 nvidia-smi；读不到 C
 | 路径 | 内容 |
 |---|---|
 | `/` `/settings` | 设置页（POST 同一路径提交表单） |
-| `/stream.mjpg?orient=N&page=P&devs=a,b&i=K` | 裸 JPEG 连续流，给掌机的播放器。`orient` 0–3 决定版式与旋转（缺省 0），`page` 0–1 决定看哪一页；`devs` 是掌机扫到的设备名，`i` 是当前序号，用来画顶栏的设备条（最多 8 台、单名 18 字符，超出截断） |
+| `/stream.mjpg?orient=N&page=P&theme=T&devs=a,b&i=K` | 裸 JPEG 连续流，给掌机的播放器。`orient` 0–3 决定版式与旋转（缺省 0），`page` 0–1 决定看哪一页，`theme` 决定配色（缺省用设置页里的）；`devs` 是掌机扫到的设备名，`i` 是当前序号，用来画顶栏的设备条（最多 8 台、单名 18 字符，超出截断） |
+| `/hd?page=P&theme=T` | 高清网页版仪表盘，键盘 / 按钮 / 触摸操作。宽屏（1280×720 起）一页显示全部内容，`page` 只对竖屏/窄屏有意义。两个参数都可省，省了就用浏览器上次记住的 |
 | `/preview.mjpg?page=P` | `multipart/x-mixed-replace`，给浏览器。不带 `page` 就跟着掌机当前那一页 |
 | `/preview?page=P` | 只有预览的页面 |
 | `/frame.jpg?page=P` | 当前单帧。没人在看的版式也会为这一次请求单独渲染 |
-| `/config.json` | 当前生效的设置 + `name`（主机名）+ `pages`（一共几页）。掌机每次连接前读它取帧率和页数，发现阶段也靠 `name` 判断"这是不是一台 PC Monitor" |
+| `/config.json` | 当前生效的设置 + `name`（主机名）+ `pages`（一共几页）+ `themes`（有哪些主题）。掌机每次连接前读它取帧率和页数，发现阶段也靠 `name` 判断"这是不是一台 PC Monitor" |
 | `/battery?pct=57&charging=0` | 掌机上报自己的电量。用 GET 是因为调用方是掌机上的 busybox curl，而且每分钟重复一次，越简单越好 |
 | `/ai` | AI 额度明细页（Claude / DeepSeek / MiniMax 全部字段） |
-| `/api/info` `/api/usage` | aimon 兼容接口，主端口和 `aimon_port` 上都有，带 CORS |
-| `/advice.json` | 最近一次 AI 建议，以及要不要念出来（`speak` + `id`） |
-| `/advice.audio` | 那条建议的语音，没有时 404 |
+| `/api/info` `/api/usage` | aimon 兼容接口，在主端口上，带 CORS |
+| `/advice.json` | 最近一次 AI 建议 |
+| `/alert.json` | 最近一次 5 小时额度告警（`id` / `text` / `pct`） |
 | `/stats.json` | 原始快照，想自己做别的客户端就用这个 |
+| `/hosts.json?rescan=1` | 局域网里扫到的 PC Monitor（`ip` / `port` / `name` / `self`），网页版的主机切换用它。答的永远是上一轮的结果，同时在后台补一次扫描，所以这个请求不会卡在 254 个连接上；`rescan=1` 催它立刻重扫 |
+
+## 主题
+
+配色不是散在各处的常量，而是 `theme.py` 里的一张表：底色、面板、三档文字灰阶、
+每个实体固定的一个色相、三个状态色，外加一个圆角半径。渲染器把整张表绑成模块级
+全局量，所以换主题是一次重新绑定，而不是把颜色参数一路传进四十个绘图函数；网页版
+则把同一张表转成 CSS 变量——两个客户端不可能画出不一样的「终端绿」。
+
+目前两套：
+
+| 名字 | 说明 |
+|---|---|
+| `dark` 深色 | 原来的配色：近黑底、白字、一个实体一个色相 |
+| `term` 终端绿 | 黑底绿字的终端风格，直角，网页版还会换成等宽字体 |
+
+终端绿里各项指标**不是**绿的：底色和正文已经是绿的，再用绿色画曲线就糊在一起了，
+所以 CPU 是亮青、GPU 是琥珀、下载是黄、上传是品红、FPS 是紫、AI 是青绿——一屏下来
+比深色主题还花，但每种颜色都对应一个固定的东西。
+
+三个地方都能换：设置页选默认值（掌机和网页都跟着变）、掌机上按 **X**、网页版上按
+**T**。后两个只影响自己那一台，不写回 PC 的配置。
+
+## 高清网页版（Windows 掌机）
+
+MJPEG 那条路是为只能解视频的 Miyoo 设计的：画面是 640×480 的位图，放在比它精细的
+屏幕上就是一张 640×480 的位图。Windows 掌机自带浏览器，所以干脆把数字发过去，让它
+自己排版：**`http://PC的IP:8765/hd`**。文字是矢量的，1080p、1600p 都清楚，PC 那边
+也不用再为它编码 JPEG。
+
+页面是同一套仪表盘——一样的格子、一样的主题，只是用 HTML 画的。横屏放得下四列时
+（1280×720 的掌机正好），两页的内容合成一页：CPU、GPU、帧率、三张进程表、磁盘、
+网络、Docker、AI 额度明细、AI 建议、天气、功耗全在一屏上，不用翻页，字号也按屏幕
+放大到 15px 起（1080p 约 19px，2K 约 23px）。竖着拿或窗口太窄时自动退回原来的
+两页版式。
+
+**Ctrl + / Ctrl −** 是有用的：字号里留了一段固定像素，所以浏览器缩放能真的改变字的
+大小（1280×720 上 125% 约大一成，150% 约大四分之一），不像纯按视口算的版式那样越
+放大字越小。放到挤不下时，仪表盘整体变成可上下滚动，而不是把每块内容压扁裁掉；
+超过 175% 就回到两页版式了。
+
+**「AI 额度明细」和「Docker 容器」这两块会自己滚。** 它们的行数是不定的——MiniMax
+每多一组模型就多两行，容器有几个就是几行——格子经常装不下。掌机没有指针，也没人会
+隔着桌子去拖滚动条，所以内容超出时它会慢慢滚到最后一行，停两秒，再滚回去，如此往复；
+装得下时就不动。鼠标停在上面时暂停，方便看清某一行。
+
+键盘操作：
+
+| 按键 | 作用 |
+|---|---|
+| **← →** / **PgUp PgDn** / **1 2** | 翻页（总览 / 详情；一页显示全部时用不着） |
+| **T** | 换主题 |
+| **F** | 全屏 |
+| **[ ]** | 刷新变慢 / 变快（0.25–10 秒，默认值在设置页里改） |
+| **N** / **P** / **0** | 看局域网里的下一台 / 上一台主机，`0` 回到本机 |
+| **R** | 立刻重扫局域网 |
+| **M** | 静音额度告警 |
+| **H** 或 **?** | 显示按键表 |
+
+顶栏右边还有一行灰色小字，把常用的几个键写在那儿；记熟了可以在设置页关掉
+（`web_hints`），按 **H** 照样能调出完整的表。
+
+### 手机和触摸屏
+
+手机上没有键盘，Windows 掌机也是先有触摸屏才有键盘，所以每个键在页面最底下都有一个
+对应的按钮：翻页 **‹ ›**、主题、刷新 **− 1.0s +**、**‹ 主机 › / 本机 / 重扫**、全屏、
+**?**（按键表）。刷新那一格和主题按钮上直接写着当前值，按一下就知道改成了什么。
+顶栏的「总览 / 详情」本身也能点，画面上**左右滑动**同样翻页。整排按钮不想要就在设置页
+关掉（`web_buttons`），省下的一行高度还给下面的格子。
+
+窄到 560px 以下（也就是竖着拿的手机）版式再变一次：仪表盘不再硬塞进一屏，而是**一列
+到底、上下滚动**，每块内容占它自己需要的高度，字号也从 13px 起跳而不是 12px。两页
+还是两页——正是它把这一列切短到值得滚。按钮栏吸在屏幕底下，拇指够得着；「AI 额度
+明细」和「Docker 容器」那两块自己滚的列表，手指拨过之后会停在原地几秒再继续。
+
+页码、主题、刷新间隔、当前在看哪台机器都记在浏览器的 localStorage 里，PC 那边不记
+这些；想固定某一页就在地址里带上参数，例如 `/hd?page=1&theme=term`，做个快捷方式
+开机就是它。
+
+### 看局域网里的别的机器
+
+网页版不止能看它自己那台。**按 N 轮流切换局域网里其他开着 PC Monitor 的机器**，
+顶栏会显示 `主机名 2/3`，切到别人家那台时多一个「远程」标记，按 **0** 回到本机。
+
+扫描是 PC 做的，不是浏览器做的——浏览器没法去连一个任意地址的端口。服务端每两分钟
+连一遍本网段的同一个端口，并且只认那些用 `/config.json` 答得上话的机器（开着端口
+不等于就是 PC Monitor），结果放在 `/hosts.json` 里给网页取。跨网段、走 VPN 这种扫
+不到的，在设置页里手填进 `web_hosts` 就行。
+
+要看的那台也得是这个版本：网页是直接去那台机器取 `/stats.json` 的，旧版本没有给
+只读接口带 CORS 头，浏览器会拦下来，页面上显示「连不上这台」。整台机器不想被这么
+访问，就把 `web_scan` 关掉。
 
 ## 排查
 
@@ -586,15 +871,12 @@ Onion），但 busybox 是 1.36、**已经删掉了 `timeout -t`**（像 ROCKNIX
 
 ## 已知限制
 
-- **CPU 温度和功耗依赖 MSI Afterburner 在运行**。建议把 Afterburner 设成开机启动，
-  它和 RTSS 是一套。GPU 温度不依赖它（来自 `nvidia-smi`）。
+- **Windows 上 CPU 温度和功耗依赖 MSI Afterburner 在运行**。建议把 Afterburner 设成
+  开机启动，它和 RTSS 是一套。GPU 温度不依赖它（来自 `nvidia-smi`）。Linux 上温度
+  白拿，功耗要 RAPL 可读，见「在 Linux 上跑」。
+- **Linux 上没有游戏 FPS**，也没有单文件可执行程序，其余指标齐全。
 - **当日流量只统计服务运行期间**，见上面「当日流量」。
 - **耗电量是估算，不是测量**，见上面「整机耗电量」。要真值只能上智能插座。
-- **语音播报要么靠 MiniMax 的在线接口，要么靠 Windows 装了中文语音包**。默认的
-  英文版 Windows 读不出中文，程序会先检查再拒绝，不会合成半句话出来。
-- **muOS 上的语音播报没在真机验证过**。那个端口用 ffmpeg 直写 framebuffer，本身
-  不碰声卡；脚本里先试 `ffplay`，再试 `ffmpeg -f alsa default`，都没有就在日志里
-  记一行并跳过——不会影响画面。Onion（ffplay）和 ROCKNIX（mpv）走各自的播放器。
 - **Docker 只在本机看得到**。列的是这台 PC 上的容器，不是掌机上的。
 - **盘温不是每块盘都有**。机械盘、USB 转接盒后面的盘、跨多块盘的卷都读不到，
   这一格会写「无温度读数」。读写速度和容量不受影响。

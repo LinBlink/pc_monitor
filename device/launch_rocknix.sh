@@ -9,6 +9,7 @@
 #     LEFT / RIGHT   prev / next discovered PC
 #     UP / DOWN      turn the page (overview / detail)
 #     Y              rotate, 4 positions (landscape / portrait / both upside down)
+#     X              next colour theme
 #     SELECT         quit back to EmulationStation
 #
 # Three things differ from the Miyoo port, and each one is a thing the earlier
@@ -38,7 +39,6 @@ stopflag=/tmp/pcmon_stop
 sweepflag=/tmp/pcmon_sweep
 pidfile=/tmp/pcmon_player
 targetfile=/tmp/pcmon_target
-audiofile=/tmp/pcmon_advice
 selfpid="$progdir/.pid"
 
 # EmulationStation launches ports through runemu.sh, which does not necessarily
@@ -63,6 +63,7 @@ export XDG_RUNTIME_DIR WAYLAND_DISPLAY
 # (BTN_SOUTH..BTN_THUMBR, then BTN_DPAD_UP..RIGHT) the indices below are fixed
 # by the driver's key bitmap, not by guesswork.
 JSBTN_Y=3            # BTN_WEST
+JSBTN_THEME=2           # BTN_NORTH, inferred; the log names the real one
 JSBTN_SELECT=8       # BTN_SELECT
 # BTN_DPAD_UP/DOWN/LEFT/RIGHT are consecutive evdev codes, so they land as
 # consecutive js0 button indices too.
@@ -76,7 +77,6 @@ PC_PORT=8765
 STREAM_FPS=8
 DISCOVER_EVERY_S=120
 BATT_EVERY_S=60
-SPEAK_EVERY_S=60
 PANEL_FLIP=0
 [ -f "$progdir/settings.cfg" ] && . "$progdir/settings.cfg"
 
@@ -109,6 +109,10 @@ compensated_orient() {
 IDX=0
 ORIENT=0
 PAGE=0
+# Empty means "whatever the PC is set to"; the theme button picks one from the
+# list the PC reports and from then on the choice is this handheld's.
+THEME=
+THEMES=
 # How many pages the PC draws. Replaced by whatever /config.json reports
 # on each connect; this is only what to assume before the first answer.
 PAGES=2
@@ -123,6 +127,24 @@ say() { echo "$(date '+%H:%M:%S') $*" >> "$log"; }
 
 save_state() {
     printf 'IDX=%s\nORIENT=%s\nPAGE=%s\n' "$IDX" "$ORIENT" "$PAGE" > "$state"
+}
+
+# The PC owns the theme list, so this walks whatever it reported. An unset
+# theme lands on the first one, which is what makes the first press do
+# something visible however the PC is configured.
+next_theme() {
+    [ -n "$THEMES" ] || return
+    first=
+    take=
+    new=
+    for t in $THEMES; do
+        [ -n "$first" ] || first=$t
+        [ "$take" = "1" ] && { new=$t; take=; }
+        [ "$t" = "$THEME" ] && take=1
+    done
+    [ -n "$new" ] || new=$first
+    THEME=$new
+    save_state
 }
 
 # Both directions exist even though there are only two pages today: UP and
@@ -277,55 +299,6 @@ battery_loop() {
     done
 }
 
-# --- spoken advice ---------------------------------------------------------
-# The PC decides everything: whether there is advice, whether it is worth saying
-# out loud, and what it sounds like. All this does is poll the PC that is
-# currently on screen, and play the clip once per advice id - which is also what
-# makes the announcement follow the device switcher rather than the LAN. Switch
-# to another PC and you hear that PC's advice, not this one's.
-# mpv is already the video player here, so it is also the one certain to be
-# installed and to understand the mp3 the PC sends.
-speak_play() {
-    mpv --no-video --really-quiet --no-input-default-bindings \
-        --input-vo-keyboard=no "$1" >> "$log" 2>&1
-}
-
-speak_loop() {
-    spoken=""
-    seen_target=""
-    while [ ! -f "$stopflag" ]; do
-        target=$(cat "$targetfile" 2>/dev/null)
-        if [ -n "$target" ]; then
-            # A different PC has its own advice numbering, so the "already said
-            # this one" memory has to be per PC or the first advice from the
-            # machine you just switched to would be swallowed.
-            if [ "$target" != "$seen_target" ]; then
-                seen_target=$target
-                spoken=""
-            fi
-            js=$(curl -s -m 5 "$target/advice.json")
-            id=$(printf '%s' "$js" | jq -r '.id // empty' 2>/dev/null)
-            say_it=$(printf '%s' "$js" |
-                jq -r 'if .speak then 1 else 0 end' 2>/dev/null)
-            if [ -n "$id" ] && [ "$say_it" = "1" ] && [ "$id" != "$spoken" ]; then
-                if curl -s -m 20 -f -o "$audiofile" "$target/advice.audio"; then
-                    spoken=$id
-                    say "advice $id from $target, speaking"
-                    speak_play "$audiofile"
-                else
-                    say "advice $id has no audio yet"
-                fi
-            fi
-        fi
-
-        i=0
-        while [ $i -lt "$SPEAK_EVERY_S" ] && [ ! -f "$stopflag" ]; do
-            sleep 1
-            i=$((i + 1))
-        done
-    done
-}
-
 # --- button reader ---------------------------------------------------------
 # Writes an action then kills mpv, in that order, so the main loop always finds
 # the action already waiting when mpv returns.
@@ -353,6 +326,7 @@ keyreader() {
         [ "$5" = "1" ] && [ "$6" = "0" ] || continue    # press, not release
         case "$8" in
             "$JSBTN_Y") echo rotate > "$cmdfile" ;;
+            "$JSBTN_THEME") echo theme > "$cmdfile" ;;
             "$JSBTN_SELECT") echo quit > "$cmdfile" ;;
             "$JSBTN_LEFT") echo prev > "$cmdfile" ;;
             "$JSBTN_RIGHT") echo next > "$cmdfile" ;;
@@ -438,7 +412,7 @@ cleanup() {
     rm -f "$selfpid"
     [ -s "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null
     for p in "${KR_PID:-}" "${DISC_PID:-}" "${BATT_PID:-}" \
-         "${SPEAK_PID:-}" "${WD_PID:-}"; do
+         "${WD_PID:-}"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     rm -f "$targetfile" "$sweepflag"
@@ -475,8 +449,6 @@ discover_loop &
 DISC_PID=$!
 battery_loop &
 BATT_PID=$!
-speak_loop &
-SPEAK_PID=$!
 watchdog &
 WD_PID=$!
 
@@ -506,6 +478,7 @@ while :; do
             pageup) turn_page -1; continue ;;
             pagedown) turn_page 1; continue ;;
             rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state; continue ;;
+            theme) next_theme; continue ;;
             refresh) continue ;;
         esac
         # Nobody home: the list may be stale, so ask the discovery loop to
@@ -522,6 +495,11 @@ while :; do
     # An older PC build does not report a page count; it also only has one page,
     # so falling back to 1 is what keeps UP and DOWN from asking it for a page
     # it cannot draw.
+    # The theme list is a JSON array; only the names are wanted, space
+    # separated. An older PC reports none, and the button does nothing.
+    THEMES=$(printf '%s' "$conf" |
+        jq -r '(.themes // []) | join(" ")' 2>/dev/null)
+
     pages=$(printf '%s' "$conf" | jq -r '.pages // empty' 2>/dev/null)
     case "$pages" in
         '' | 0 | *[!0-9]*) PAGES=1 ;;
@@ -540,7 +518,7 @@ while :; do
     devs=$(device_list)
     say "connect $host idx=$IDX/$total orient=$ORIENT send=$send" \
         "srv_flip=$srv_flip rate=$rate devs=$devs"
-    play "$base/stream.mjpg?orient=$send&page=$PAGE&devs=$devs&i=$IDX" "$rate"
+    play "$base/stream.mjpg?orient=$send&page=$PAGE&devs=$devs&i=$IDX${THEME:+&theme=$THEME}" "$rate"
     say "mpv exit $?"
 
     take_cmd
@@ -556,6 +534,7 @@ while :; do
         pageup) turn_page -1 ;;
         pagedown) turn_page 1 ;;
         rotate) ORIENT=$(((ORIENT + 1) % 4)); save_state ;;
+        theme) next_theme ;;
         refresh)
             new=$(grep -n "^$host|" "$hosts" 2>/dev/null | cut -d: -f1 | head -1)
             IDX=$([ -n "$new" ] && echo $((new - 1)) || echo 0)

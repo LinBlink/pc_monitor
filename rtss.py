@@ -4,6 +4,10 @@ RTSS publishes a shared-memory block named ``RTSSSharedMemoryV2`` containing an
 array of application entries. Each entry carries a rolling frame counter and the
 tick window it was measured over, which is all we need for an instantaneous FPS.
 
+RTSS is a Windows program and there is no equivalent anywhere else, so on Linux
+every function here reports "nothing to see": the FPS tile then shows a dash,
+which is the right answer for a headless server that is not rendering anything.
+
 Nothing here fails hard: if RTSS is not running the mapping either does not exist
 or carries no signature, and :func:`read_fps` returns ``None``.
 """
@@ -37,14 +41,27 @@ _OFF_STAT_FRAMERATE_AVG = 0x134
 # already exited or is not currently presenting.
 STALE_MS = 3000
 
-_GetTickCount = ctypes.windll.kernel32.GetTickCount
-_GetTickCount.restype = ctypes.c_uint32
+IS_WINDOWS = os.name == "nt"
 
-_user32 = ctypes.windll.user32
+# What the FPS tile says when there is no framerate. On Windows that is a missing
+# program and the text is an instruction; on Linux it is a fact about the platform
+# and pointing at RTSS would only send someone looking for software that does not
+# exist there.
+STATE_MISSING = "RTSS 未运行" if IS_WINDOWS else "无 FPS 源"
+HINT_LONG = "请启动 MSI Afterburner / RTSS" if IS_WINDOWS else "Linux 上没有 FPS 统计"
+HINT_SHORT = "需 Afterburner / RTSS" if IS_WINDOWS else "Linux 无 FPS"
+
+if IS_WINDOWS:
+    _GetTickCount = ctypes.windll.kernel32.GetTickCount
+    _GetTickCount.restype = ctypes.c_uint32
+
+    _user32 = ctypes.windll.user32
 
 
 def foreground_pid() -> int:
     """PID owning the foreground window, or 0."""
+    if not IS_WINDOWS:
+        return 0
     hwnd = _user32.GetForegroundWindow()
     if not hwnd:
         return 0
@@ -143,6 +160,8 @@ def read_fps() -> FpsSample | None:
 
 def is_running() -> bool:
     """True when the RTSS shared memory block exists and is signed."""
+    if not IS_WINDOWS:
+        return False
     try:
         head = _open(_HEADER.size)
     except OSError:

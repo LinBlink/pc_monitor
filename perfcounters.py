@@ -20,9 +20,9 @@ first :meth:`CounterQuery.collect` after opening returns nothing.
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
+import os
 
-_pdh = ctypes.WinDLL("pdh.dll")
+IS_WINDOWS = os.name == "nt"
 
 PDH_FMT_DOUBLE = 0x00000200
 PDH_FMT_NOCAP100 = 0x00008000
@@ -31,30 +31,38 @@ PDH_INVALID_DATA = 0xC0000BC6
 PDH_CALC_NEGATIVE_DENOMINATOR = 0x800007D8
 
 
-class _CounterValue(ctypes.Structure):
-    _fields_ = [("CStatus", wintypes.DWORD),
-                ("doubleValue", ctypes.c_double)]
-
-
-class _CounterItem(ctypes.Structure):
-    _fields_ = [("szName", wintypes.LPWSTR),
-                ("FmtValue", _CounterValue)]
-
-
-_pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p,
-                               ctypes.POINTER(ctypes.c_void_p)]
-_pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
-                                       ctypes.c_void_p,
-                                       ctypes.POINTER(ctypes.c_void_p)]
-_pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
-_pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
-_pdh.PdhGetFormattedCounterArrayW.argtypes = [
-    ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
-    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
-
-
 class PdhError(OSError):
     pass
+
+
+# Everything below the guard touches Win32 types. ``ctypes.wintypes`` cannot even
+# be imported on Linux, so the whole binding lives inside the branch and
+# :class:`CounterQuery` refuses to open elsewhere — callers already treat
+# :class:`PdhError` as "this machine has no counters", which is exactly the truth
+# on a Linux box.
+if IS_WINDOWS:
+    from ctypes import wintypes
+
+    _pdh = ctypes.WinDLL("pdh.dll")
+
+    class _CounterValue(ctypes.Structure):
+        _fields_ = [("CStatus", wintypes.DWORD),
+                    ("doubleValue", ctypes.c_double)]
+
+    class _CounterItem(ctypes.Structure):
+        _fields_ = [("szName", wintypes.LPWSTR),
+                    ("FmtValue", _CounterValue)]
+
+    _pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_void_p)]
+    _pdh.PdhAddEnglishCounterW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR,
+                                           ctypes.c_void_p,
+                                           ctypes.POINTER(ctypes.c_void_p)]
+    _pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+    _pdh.PdhCloseQuery.argtypes = [ctypes.c_void_p]
+    _pdh.PdhGetFormattedCounterArrayW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 
 
 class CounterQuery:
@@ -66,6 +74,8 @@ class CounterQuery:
     """
 
     def __init__(self, paths: dict[str, str]):
+        if not IS_WINDOWS:
+            raise PdhError("PDH counters exist only on Windows")
         self._handle = ctypes.c_void_p()
         status = _pdh.PdhOpenQueryW(None, None, ctypes.byref(self._handle))
         if status:

@@ -10,10 +10,6 @@ config.json
 traffic.json
 power.json
 history.jsonl
-advice.mp3
-advice.wav
-.tts.ps1
-.tts.txt
 srv.log
 srv.err
 
